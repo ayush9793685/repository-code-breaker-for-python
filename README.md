@@ -216,8 +216,3 @@ a functionality from its signature (APIs, method calls, attributes, callee clust
 - [ ] Make the MongoDB-backed language detector optional (extension-based fallback)
 - [ ] `requirements.txt` and tests
 
----
-
-## License
-
-Add your license here.
