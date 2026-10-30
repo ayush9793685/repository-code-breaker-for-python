@@ -9,10 +9,16 @@ detects the language of an entry file and dispatches to a broker such as ``Pytho
 Broker contract used by the dispatcher (every language broker follows it):
 
     broker = XBroker(root, entry_file, internal_hints)
-    broker.run()                    # analyse
-    broker.write_outputs(outdir)    # write the common PatchPlus output files
+    broker.run()                    # language-specific analysis
+    broker.normalized_result()      # -> dict following normalized.py (schema patchplus.normalized)
     broker.reachable_count          # number of reachable symbols
     broker.summary_lines()          # short human readable result lines
+
+Optional hooks, called by app_broker after ITS shared trace-tree processing (all of them need language
+semantics, so they stay in the language broker): ``attach_trace_tree(root, stats)``,
+``functionality_document()``, ``topdown_document()``, ``report_text()`` and the static
+``topdown_from_trace(trace_tree_doc)`` used by ``--from-trace``.  A broker writes NO files: every output
+file is written by app_broker (one authoritative writer).
 
 ``entry_file`` is a source/configuration FILE chosen by the user (never a function).  Which
 function (if any) execution starts from is decided here, by ``PythonBroker.resolve_entry()``.
@@ -38,10 +44,10 @@ import sys
 import tokenize
 from collections import OrderedDict, defaultdict, namedtuple
 from datetime import datetime
-from xml.sax.saxutils import escape as _xml_escape
 
 from broker_common import EXCLUDE_DIRS
 from project_tree import build_project_tree, render_project_tree
+from normalized import new_result, parse_trace
 
 try:                                    # pyproject.toml entry declarations (Python >= 3.11)
     import tomllib
@@ -79,6 +85,7 @@ class Scope:
         self.vars = {}            # local var -> Target (instance type)
         self.local_funcs = {}     # nested def name -> symbol id
         self.bindings = None      # name -> Binding (function-reference tables / aliases); None = module level
+        self.multi = {}           # local var -> [Target]: SEVERAL statically possible values (no runtime input needed)
 
 
 class Binding:
@@ -770,7 +777,15 @@ def legacy_setup_entry_points(src):
     return scripts, package_dir, wheres
 
 class PythonBroker:
-    def __init__(self, root, entry_file, internal_hints, entry_override=None):
+    SUPPORTS_FRAMEWORK_ANALYSIS = True      # app_broker passes framework= / arch_depth= only to brokers that say so
+    SUPPORTS_COLLECTOR = True               # app_broker passes collector= (its ONE shared FileCollector) to such brokers
+
+    def __init__(self, root, entry_file, internal_hints, entry_override=None, framework="auto",
+                 arch_depth=1, arch_max_files=5000, collector=None, focus=None):
+        self.collector = collector            # shared file_collector.FileCollector owned by App Broker (never created here)
+        self.focus = list(focus or [])        # symbols of the entry file to analyse (e.g. the view a URL route resolved to)
+        self._focus_extra = []                # further focused symbols, traced after the first
+        self._discovered = None               # cached result of discovered_references()
         self.root = os.path.abspath(root)
         self.entry = posixpath.normpath(entry_file.replace("\\", "/"))   # the user-selected FILE
         self.entry_info = None    # resolved execution entry (see resolve_entry)
@@ -796,6 +811,8 @@ class PythonBroker:
         self.tree_root = {"text": "ROOT", "children": []}
         self._tree_stack = [(-1, self.tree_root)]
         self.trace = []           # expanded source trace lines
+        self.trace_entries = []   # the same lines, structured: (depth, file, line, text)
+        self._normalized = None
         self.trace_done = set()
         self.call_sites = {}      # (file, line) -> 'external' | 'stdlib'  (for trace-tree colouring)
         self.trace_tree_stats = None
@@ -817,6 +834,14 @@ class PythonBroker:
         self._fn_bindings = {}      # function symbol id -> {name: Binding}
         self.referenced = set()     # function ids mentioned (not called) in a container, alias or argument
         self.dispatch_targets = set()   # function ids reached through an indirect (dispatch) call
+        self._param_hints = {}      # callee symbol id -> {param: [Target]} taken from the arguments at its call sites
+        # framework / configuration architecture (additive; see "Framework / configuration architecture traversal")
+        self.framework_mode = framework           # "auto" | "none" | a name in FRAMEWORK_ANALYZERS
+        self.arch_depth = arch_depth              # import hops followed from configuration-discovered files
+        self.arch_max_files = arch_max_files
+        self.framework_info = None                # result dict, or None when no framework analysis ran
+        self.framework_error = None
+        self.arch_symbols = set()                 # symbol ids named by configuration (ROUTES_TO); NOT in `reached`
 
     # ------------------------------------------------------------------
     # Broker contract (see module docstring)
@@ -832,6 +857,13 @@ class PythonBroker:
             lines.append(f"  dispatch edges: {n_disp}  referenced functions: {len(self.referenced)}")
         if self.legacy_files:
             lines.append(f"  text-based (legacy) files: {len(self.legacy_files)} of {len(self.py_files)} .py files")
+        fi = self.framework_info
+        if fi and fi.get("active"):
+            st = fi["statistics"]
+            lines.append(f"  {fi['framework']} architecture: executed files {st['execution_reached_files']}, "
+                         f"import-reached {st['import_reached_files']}, configuration {st['configuration_files']} "
+                         f"(not executed: {st['configuration_only_files']}), architecture imports "
+                         f"{st['architecture_import_files']}, unresolved {st['unresolved']}")
         return lines
 
     # ------------------------------------------------------------------
@@ -937,7 +969,9 @@ class PythonBroker:
     # ------------------------------------------------------------------
     # Module / name resolution
     # ------------------------------------------------------------------
-    def find_module_file(self, module, level, from_rel):
+    def find_module_file(self, module, level, from_rel, strict=False):
+        """strict=True disables the flat-layout basename fallback: configuration analysis must never
+        resolve a dotted name to a file that merely has the same basename."""
         parts = module.split(".") if module else []
         if level:
             base = os.path.dirname(from_rel)
@@ -957,11 +991,35 @@ class PythonBroker:
                 if c in self.py_files:
                     return c
         # Fallback for flat layouts: unique file whose basename matches the last part
-        if parts:
+        if parts and not strict:
             matches = [f for f in self.py_files if os.path.basename(f) == parts[-1] + ".py"]
             if len(matches) == 1:
                 self.fallback_resolutions[(module, from_rel)] = matches[0]
                 return matches[0]
+        return None
+
+    def _strict_module_file(self, module, level, from_rel):
+        """Exact module resolution for configuration analysis (no basename fallback).  Besides the regular import
+        bases, the sys.path root implied by the Django-style layout is tried: the directory above the top-most
+        package that contains the file (the entry file's directory is already in import_bases)."""
+        saved = self.import_bases
+        d = posixpath.dirname(from_rel)
+        while d and f"{d}/__init__.py" in self.py_files:
+            d = posixpath.dirname(d)
+        self.import_bases = list(saved) + ([d] if d not in saved else [])
+        try:
+            return self.find_module_file(module, level, from_rel, strict=True)
+        finally:
+            self.import_bases = saved
+
+    def _submodule_file(self, rel, name):
+        """`name` as a submodule of the package whose __init__.py is `rel` (file-system based, base independent)."""
+        if posixpath.basename(rel) != "__init__.py":
+            return None
+        d = posixpath.dirname(rel)
+        for cand in (f"{d}/{name}.py" if d else f"{name}.py", f"{d}/{name}/__init__.py" if d else f"{name}/__init__.py"):
+            if cand in self.py_files:
+                return cand
         return None
 
     def classify_module(self, module, level, from_rel):
@@ -1066,6 +1124,100 @@ class PythonBroker:
                             scope.vars[name] = t
             elif not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 stack.extend(ast.iter_child_nodes(n))
+
+    # ------------------------------------------------------------------
+    # Input-independent resolution: when a value depends on runtime input (``LANGUAGE_BROKERS.get(language)``,
+    # ``getattr(table[key], "name")``, a parameter ...) EVERY statically possible target is followed.  Nothing is
+    # executed and nothing is invented: candidates come only from tables / aliases / call sites in the code.
+    # ------------------------------------------------------------------
+    def resolve_candidates(self, node, scope, depth=0):
+        """All statically possible Targets of an expression (a superset of ``resolve_expr``; [] when unknown)."""
+        if depth > 6:
+            return []
+        t = self.resolve_expr(node, scope)
+        if t is not None:
+            return [t]
+        out = []
+
+        def add(x):
+            if x is not None and not any((x.kind, x.ref, x.label) == (y.kind, y.ref, y.label) for y in out):
+                out.append(x)
+        sym_target = lambda sid: Target("symbol", sid, self.symbols[sid].name)
+        if isinstance(node, ast.Name):
+            for x in scope.multi.get(node.id, ()):
+                add(x)
+            b = self._lookup_name_binding(node.id, scope)
+            if not out and b is not None and b.kind == "alias":
+                for _, sid, _ in b.entries:
+                    add(sym_target(sid))
+        elif isinstance(node, ast.Attribute):
+            for base in self.resolve_candidates(node.value, scope, depth + 1):
+                add(self._resolve_attr(base, node.attr))
+        elif isinstance(node, (ast.Subscript, ast.Call)):
+            look = self._lookup_target(node, scope)             # table[key] / table.get(key): every entry
+            if look is not None:
+                src, key_node = look
+                for _, sid, _ in self._select(src, key_node):
+                    add(sym_target(sid))
+            elif isinstance(node, ast.Call):
+                f = node.func
+                if (isinstance(f, ast.Name) and f.id == "getattr" and len(node.args) >= 2
+                        and _const_str(node.args[1])):          # getattr(x, "name"[, default]) -> x.name
+                    for base in self.resolve_candidates(node.args[0], scope, depth + 1):
+                        add(self._resolve_attr(base, _const_str(node.args[1])))
+                else:                                           # Class(...) -> instance; library call -> library object
+                    for fc in self.resolve_candidates(f, scope, depth + 1):
+                        if ((fc.kind == "symbol" and self.symbols[fc.ref].kind == "class")
+                                or fc.kind in ("external", "stdlib", "missing")):
+                            add(fc)
+        return out
+
+    def _bind_candidates(self, targets, value, scope):
+        """x = <expr with several possible values>: remember them all for the later calls on x."""
+        cands = self.resolve_candidates(value, scope)
+        if not cands:
+            return
+        for tg in targets:
+            if isinstance(tg, ast.Name):
+                if len(cands) == 1:
+                    scope.vars[tg.id] = cands[0]
+                    scope.multi.pop(tg.id, None)
+                else:
+                    scope.multi[tg.id] = cands
+                    scope.vars.pop(tg.id, None)
+
+    def _note_param_types(self, sym, call, scope):
+        """Argument values of one call site become the candidate values of the callee's parameters."""
+        if not isinstance(sym.node, _DEF_NODES):
+            return
+        a = sym.node.args
+        params = [p.arg for p in list(a.posonlyargs) + list(a.args)]
+        static = any(isinstance(d, ast.Name) and d.id == "staticmethod" for d in sym.node.decorator_list)
+        if sym.kind == "method" and not static:
+            params = params[1:]                                 # self / cls
+        known = set(params) | {p.arg for p in a.kwonlyargs}
+        named = {}
+        for p, arg in zip(params, call.args):
+            if isinstance(arg, ast.Starred):
+                break
+            named[p] = arg
+        for kw in call.keywords:
+            if kw.arg in known:
+                named[kw.arg] = kw.value
+        hints = self._param_hints.setdefault(sym.id, {})
+        for p, arg in named.items():
+            for t in self.resolve_candidates(arg, scope):
+                if t.kind == "symbol":
+                    lst = hints.setdefault(p, [])
+                    if not any((t.ref, t.label) == (x.ref, x.label) for x in lst):
+                        lst.append(t)
+
+    def _apply_param_hints(self, scope, sym):
+        for name, ts in self._param_hints.get(sym.id, {}).items():
+            if len(ts) == 1:
+                scope.vars[name] = ts[0]
+            else:
+                scope.multi[name] = list(ts)
 
     def class_bases(self, cls_id):
         sym = self.symbols[cls_id]
@@ -1196,8 +1348,8 @@ class PythonBroker:
             return a[0] + b[0], a[1] or b[1]
         if isinstance(expr, (ast.Name, ast.Attribute)):
             t = self.resolve_expr(expr, scope)
-            if t is not None and t.kind == "symbol" and self.symbols[t.ref].kind in ("function", "method"):
-                return [t.ref], None
+            if t is not None and t.kind == "symbol" and self.symbols[t.ref].kind in ("function", "method", "class"):
+                return [t.ref], None                       # classes too: LANGUAGE_BROKERS = {"Python": PythonBroker}
             if t is not None:                              # class / module / builtin / library: not a project function
                 return [], None
             return [], f"unresolved reference {ast.unparse(expr)}"
@@ -1550,7 +1702,11 @@ class PythonBroker:
                        type="DISPATCHES_TO", target=sid, file=scope.file, line=node.lineno,
                        target_file=sym.file, target_line=sym.line, already_visited=again,
                        resolution=d["status"], conditions=conds)
-            self.trace_symbol(sid, depth + 1)
+            if sym.kind == "class":
+                self.handle_call(node, Target("symbol", sid, sym.name), scope, depth + 1)
+            else:
+                self._note_param_types(sym, node, scope)
+                self.trace_symbol(sid, depth + 1)
         if d["status"] == "partial":
             self._unresolved(scope, node, "dispatch partially resolved (more targets possible): "
                                           + "; ".join(d["reasons"]))
@@ -1698,9 +1854,35 @@ class PythonBroker:
         if self._entry_override is not None:                             # never fall back to the descriptor
             raise SystemExit(f"Declared entry point {self._entry_override[1]}={self._entry_override[2]} "
                              f"does not resolve to a repository file")
+        if self.focus and self.entry in self.files:                      # D. a file reached through a URL route
+            info = self._resolve_focus_entry()
+            if info:
+                return info
         if self.entry not in self.py_files:
             raise SystemExit(f"No Python entry point declared in {self.entry}")
         return self._resolve_file_entry(self.entry)                      # B, C (AST or text)
+
+    def _resolve_focus_entry(self):
+        """Cross-file traversal: the file was reached because something (a Django route) points at specific
+        functions / classes in it.  Those are the entry: a function as is, a class through its own methods
+        (class-based view).  Returns None when none of them is defined in the file (-> B / C as usual)."""
+        syms = []
+        for name in self.focus:
+            base = self.symbols.get(f"{self.entry}:{name}")
+            if base is None:
+                continue
+            found = ([s for s in self.symbols.values() if s.parent == base.id and s.kind == "method"]
+                     if base.kind == "class" else [base])
+            syms += [s for s in found if s not in syms]
+        if not syms:
+            return None
+        self._focus_extra = syms[1:]
+        first = syms[0]
+        via = dict(declared_in="URL configuration", group="route view", script=", ".join(self.focus),
+                   target=f"{self.entry}:{first.name}", file=self.entry,
+                   alternatives=[f"{s.name}={self.entry}:{s.name}" for s in syms[1:]])
+        return dict(kind="function", sym=first, file=first.file, line=first.line, owner=first.id,
+                    pseudo=_FUNC_FILE_FUNCENTRY, via=via)
 
     def _announce_entry(self):
         """Three distinct situations for the selected .py entry file."""
@@ -1946,7 +2128,9 @@ class PythonBroker:
         """A fresh broker for ONE discovered entry that reuses this broker's repository index, so a repository
         with N entries is indexed once.  All analysis state (trace, graph, expanded set ...) is new."""
         b = PythonBroker(self.root, self.entry, self.internal_hints,
-                         entry_override=(entry["group"], entry["entry_point_name"], entry["target"]))
+                         entry_override=(entry["group"], entry["entry_point_name"], entry["target"]),
+                         framework=self.framework_mode, arch_depth=self.arch_depth,
+                         arch_max_files=self.arch_max_files)
         b.files, b.sources, b.py_files = self.files, self.sources, self.py_files
         b.legacy_files, b.legacy_reasons = self.legacy_files, self.legacy_reasons
         b.analysis_mode, b.text_info, b.imports = self.analysis_mode, self.text_info, self.imports
@@ -1982,6 +2166,205 @@ class PythonBroker:
             self.entry_info = self.resolve_entry()
         return self.entry_info
 
+    # ------------------------------------------------------------------
+    # Cross-file discovery (shared FileCollector, owned by App Broker)
+    #
+    # The broker only REPORTS what it found (discovered_references) and, when App Broker asks, hands it to the
+    # one shared collector (submit_discovered_references).  It never creates a collector, never decides when a
+    # discovered file is analysed, and never changes the analysis output above.
+    # ------------------------------------------------------------------
+    # template-loading calls -> position of the template-name argument
+    _TEMPLATE_CALLS = {"render": 1, "render_to_response": 0, "render_to_string": 0, "get_template": 0,
+                       "select_template": 0, "TemplateResponse": 1, "SimpleTemplateResponse": 0}
+    _TEMPLATE_RE = re.compile(r"""(?:template_name\s*=\s*|\b(?:render|get_template|render_to_string|select_template)"""
+                              r"""\(\s*(?:request\s*,\s*)?)['"]([^'"\n]+)['"]""")
+    _IMPORT_LINE_RE = re.compile(r"^[ \t]*(?:from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+([^#\n]+)|import[ \t]+([^#\n]+))", re.M)
+
+    def fork_for_file(self, file, focus=None):
+        """A fresh broker for ONE discovered file that reuses this broker's repository index (so N discovered
+        files cost one indexing pass, not N).  Meant to be called on an index-only broker (index_repository()
+        done, run() never called); all analysis state of the fork is new."""
+        if not self._index_ready:
+            self.index_repository()
+        b = type(self)(self.root, file, self.internal_hints, framework=self.framework_mode,
+                         arch_depth=self.arch_depth, arch_max_files=self.arch_max_files, collector=self.collector,
+                         focus=focus)
+        b.files, b.sources, b.py_files = self.files, self.sources, self.py_files
+        b.legacy_files, b.legacy_reasons = self.legacy_files, self.legacy_reasons
+        b.analysis_mode, b.text_info, b.imports = self.analysis_mode, self.text_info, self.imports
+        b.parse_errors, b.package_map = list(self.parse_errors), list(self.package_map)
+        b.symbols = OrderedDict((k, v) for k, v in self.symbols.items() if "<local>" not in k)
+        b._index_ready = True
+        return b
+
+    def _scan_files(self):
+        """Files whose references are reported: the entry and every file the analysis reached."""
+        files = set(self.reached_files) | {self.entry}
+        if self.entry_info:
+            files.add(self.entry_info["file"])
+        return sorted(f for f in files if f in self.py_files)
+
+    def _import_target(self, rel, module, level, names, line, add):
+        """One import statement -> project files (strict, exact module lookup; no basename guessing)."""
+        found = False
+        for name in (names or [None]):
+            dotted = f"{module}.{name}" if (module and name) else (name or module)
+            f = self._strict_module_file(dotted, level, rel) if (dotted or level) else None
+            shown = ("." * level) + (dotted or "")                # the module as written in the source
+            if f is None and name is not None:                    # `from pkg import symbol`: the file is pkg itself
+                f = self._strict_module_file(module, level, rel) if (module or level) else None
+                shown = ("." * level) + (module or "")
+            if f is not None:
+                found = True
+                if f != rel:
+                    add(reference=shown or ".", source_file=rel, line=line, relationship="imports", kind="import",
+                        disposition="queue", files=[f], reason=None)
+        if not found:
+            top = (module or "").split(".")[0] or (names or [""])[0].split(".")[0]
+            if level or (top and top in self.internal_hints):
+                add(reference=("." * level) + (module or "") + (f" import {', '.join(names)}" if names else ""),
+                    source_file=rel, line=line, relationship="imports", kind="import", disposition="unresolved",
+                    files=[], reason="project-local module does not resolve to a file in the repository")
+            # standard-library and third-party imports are intentionally not reported / not queued
+
+    def _template_names(self, node):
+        """Template-name argument -> ([constant names], dynamic expression text or None)."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node.value], None
+        if isinstance(node, (ast.List, ast.Tuple)):
+            names = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            return names, (None if len(names) == len(node.elts) else ast.unparse(node)[:60])
+        return [], ast.unparse(node)[:60]
+
+    def _module_ref(self, rel, dotted, line, relationship, add):
+        """A dotted module name written as a STRING (settings / URLconf wiring) -> project file, or unresolved."""
+        f = self._strict_module_file(dotted, 0, rel)
+        if f and f != rel:
+            add(reference=dotted, source_file=rel, line=line, relationship=relationship, kind="import",
+                disposition="queue", files=[f], reason=None)
+        elif not f and dotted.split(".")[0] in self.internal_hints:
+            add(reference=dotted, source_file=rel, line=line, relationship=relationship, kind="import",
+                disposition="unresolved", files=[], reason="project-local module does not resolve to a file")
+
+    def _config_references(self, rel, node, add):
+        """Django wiring that is not an import statement: ``DJANGO_SETTINGS_MODULE``, ``ROOT_URLCONF`` and
+        ``include("pkg.urls")`` name project modules as strings.  Following them lets a traversal that starts at
+        manage.py / settings.py reach the URLconfs and, through their imports, the views."""
+        def const(n):
+            return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
+        if isinstance(node, ast.Call):
+            last = (_dotted(node.func) or "").rsplit(".", 1)[-1]
+            if last == "setdefault" and len(node.args) >= 2 and const(node.args[0]) == "DJANGO_SETTINGS_MODULE" \
+                    and const(node.args[1]):
+                self._module_ref(rel, const(node.args[1]), node.lineno, "settings_module", add)
+            elif last == "include" and node.args and const(node.args[0]):
+                self._module_ref(rel, const(node.args[0]), node.lineno, "includes_urlconf", add)
+        elif isinstance(node, ast.Assign) and const(node.value):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "ROOT_URLCONF":
+                    self._module_ref(rel, const(node.value), node.lineno, "root_urlconf", add)
+                elif isinstance(t, ast.Subscript) and const(t.slice) == "DJANGO_SETTINGS_MODULE":
+                    self._module_ref(rel, const(node.value), node.lineno, "settings_module", add)
+
+    def discovered_references(self):
+        """Project-local files referenced by the analysed code, for the shared FileCollector.
+
+        Each item: reference, source_file, line, relationship ("imports" | "renders_template" | "template_name"),
+        kind ("import" | "template"), disposition ("queue" | "unresolved"), files ([project-relative paths]), reason.
+        Standard-library and third-party imports are neither reported nor queued; nothing outside the repository
+        or nonexistent is ever placed in ``files``.  Template names are looked up in the project's ``templates``
+        directories (django_routes.TemplateIndex); every candidate is kept when several match (ambiguous)."""
+        if self._discovered is not None:
+            return self._discovered
+        from django_routes import TemplateIndex
+        templates = TemplateIndex(self.root)
+        refs, seen = [], set()
+
+        def add(**r):
+            key = (r["kind"], r["reference"], r["source_file"], r["line"], r["disposition"])
+            if key not in seen:
+                seen.add(key)
+                refs.append(r)
+
+        def template(rel, name, line, relationship):
+            files = templates.lookup(name)
+            if files:
+                add(reference=name, source_file=rel, line=line, relationship=relationship, kind="template",
+                    disposition="queue", files=files,
+                    reason=(f"ambiguous: {len(files)} templates share this name" if len(files) > 1 else None))
+            else:
+                add(reference=name, source_file=rel, line=line, relationship=relationship, kind="template",
+                    disposition="unresolved", files=[],
+                    reason="no HTML template with this name under any 'templates' directory")
+
+        for rel in self._scan_files():
+            tree = self.files.get(rel)
+            if tree is not None:
+                for node in ast.walk(tree):
+                    self._config_references(rel, node, add)
+                    if isinstance(node, ast.Import):
+                        for a in node.names:
+                            self._import_target(rel, a.name, 0, None, node.lineno, add)
+                    elif isinstance(node, ast.ImportFrom):
+                        self._import_target(rel, node.module or "", node.level,
+                                            [a.name for a in node.names if a.name != "*"] or None, node.lineno, add)
+                    elif isinstance(node, ast.Call):
+                        text = _dotted(node.func)
+                        parts = text.split(".") if text and "(" not in text and "[" not in text else []
+                        fname = parts[-1] if parts else None
+                        idx = self._TEMPLATE_CALLS.get(fname)
+                        if idx is not None and len(node.args) > idx:
+                            names, dyn = self._template_names(node.args[idx])
+                            for n in names:
+                                template(rel, n, node.lineno, "renders_template")
+                            if dyn and (len(parts) == 1 or parts[-2] in ("shortcuts", "loader")):
+                                add(reference=dyn, source_file=rel, line=node.lineno, relationship="renders_template",
+                                    kind="template", disposition="unresolved", files=[],
+                                    reason="dynamic template name: not evaluated")
+                        for kw in node.keywords:
+                            if kw.arg == "template_name":
+                                for n in self._template_names(kw.value)[0]:
+                                    template(rel, n, node.lineno, "template_name")
+                    elif isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "template_name"
+                                                              for t in node.targets):
+                        for n in self._template_names(node.value)[0]:
+                            template(rel, n, node.lineno, "template_name")
+            else:                                                  # text-analysed (legacy) file: regex fallback
+                src = self.sources.get(rel, "")
+                for m in self._IMPORT_LINE_RE.finditer(src):
+                    line = src.count("\n", 0, m.start()) + 1
+                    if m.group(3) is not None:
+                        names = [n.strip().split(" as ")[0].strip("() ") for n in m.group(3).split(",")]
+                        self._import_target(rel, m.group(2), len(m.group(1)), [n for n in names if n and n != "*"] or None,
+                                            line, add)
+                    else:
+                        for part in m.group(4).split(","):
+                            mod = part.strip().split(" as ")[0].strip()
+                            if mod:
+                                self._import_target(rel, mod, 0, None, line, add)
+                for m in self._TEMPLATE_RE.finditer(src):
+                    template(rel, m.group(1), src.count("\n", 0, m.start()) + 1, "template_name")
+        self._discovered = refs
+        return refs
+
+    def submit_discovered_references(self):
+        """Hand discovered project-local files to the shared collector (App Broker calls this after run()).
+        Returns the number of NEW files queued; 0 when no collector was injected."""
+        if self.collector is None:
+            return 0
+        added = 0
+        for r in self.discovered_references():
+            if r["disposition"] != "queue":
+                continue
+            for f in r["files"]:
+                meta = {"line": r["line"], "kind": r["kind"], "relationship": r["relationship"]}
+                if r["kind"] == "template":
+                    meta["role"] = "template"
+                if self.collector.add_path(os.path.join(self.root, f), source_broker="python",
+                                           source_file=r["source_file"], original_reference=r["reference"], meta=meta):
+                    added += 1
+        return added
+
     def run(self):
         if not self._index_ready:                  # a forked broker shares its parent's index
             self.index_repository()                # unchanged: never depends on an entry
@@ -1995,6 +2378,11 @@ class PythonBroker:
             self._emit(0, f"ENTRY  {sym.file}:{sym.line}  def {sym.name}   ({via})",
                        type="ENTRY", target=sym.id, file=sym.file, line=sym.line)
             self.trace_symbol(sym.id, 1)
+            for extra in self._focus_extra:                  # further route views of the same file
+                self._node(extra.id, "entry", extra.file, extra.line)
+                self._emit(0, f"ENTRY  {extra.file}:{extra.line}  def {extra.name}   ({via})",
+                           type="ENTRY", target=extra.id, file=extra.file, line=extra.line)
+                self.trace_symbol(extra.id, 1)
         elif info["kind"] == "legacy":              # text-based analysis (lower confidence)
             self._run_legacy(info, via)
         elif info["kind"] == "main_block":
@@ -2013,8 +2401,103 @@ class PythonBroker:
             scope = Scope(efile, None, info["owner"])
             for stmt in info["stmts"]:
                 Visitor(self, scope, 1).visit(stmt)
-        self._include_legacy_imports()
+        # With a shared FileCollector (App Broker's cross-file traversal) the files this one points at are queued
+        # and analysed one by one by App Broker, so the two internal multi-file walks are not run here:
+        #   _include_legacy_imports  - pulled imported modules into reached_files
+        #   analyze_frameworks       - walked settings -> URLconfs -> views -> apps on its own
+        # Without a collector (single-file runs, --no-follow-references) both run exactly as before.
+        if self.collector is None:
+            self._include_legacy_imports()
         self._build_import_edges()
+        if self.collector is None:
+            self.analyze_frameworks()           # architecture-only; never changes reached / reached_files
+
+    def analyze_frameworks(self):
+        """Configuration-driven architecture traversal (Django first).  Additive and isolated: it only adds
+        architecture edges / nodes and `framework_info`; a failure here never breaks the execution outputs."""
+        self.framework_info = None
+        mode = (self.framework_mode or "none").lower()
+        if mode == "none":
+            return
+        names = list(FRAMEWORK_ANALYZERS) if mode == "auto" else [mode]
+        for name in names:
+            cls = FRAMEWORK_ANALYZERS.get(name)
+            if cls is None:
+                raise SystemExit(f"Unknown framework '{name}' (supported: {', '.join(FRAMEWORK_ANALYZERS)})")
+            before = (set(self.reached), set(self.reached_files), set(self.expanded))
+            try:
+                an = cls(self)
+                seed = an.detect()
+                if seed is None:
+                    continue
+                self.framework_info = an.analyze(seed)
+            except Exception as e:               # defensive: the execution outputs must survive
+                import traceback
+                self.framework_error = f"{type(e).__name__}: {e}"
+                print(f"WARNING: {name} architecture analysis failed; execution outputs are unaffected: "
+                      f"{self.framework_error}", file=sys.stderr)
+                traceback.print_exc()
+            if before != (self.reached, self.reached_files, self.expanded):
+                raise AssertionError("architecture pass altered execution state")
+            if self.framework_info:
+                return
+        if mode != "auto":
+            self.framework_info = OrderedDict(framework=mode, active=False,
+                                              reason=f"entry {self.entry} shows no {mode} settings / URL configuration")
+
+    @staticmethod
+    def discover_framework_entries(root):
+        """Framework-aware discovery for app_broker (no --entry given).  Returns dicts
+        {file, role, framework, settings_module, covered_by}.  `process_entry` = file that starts the framework
+        (calls execute_from_command_line / get_wsgi_application / get_asgi_application and names the settings
+        module); `configuration_root` = settings module (assigns ROOT_URLCONF / INSTALLED_APPS).  Request-routing
+        roots are NOT listed: they are derived from ROOT_URLCONF during analysis.  A configuration root already
+        named by a discovered process entry has `covered_by` set (it is analysed through that entry)."""
+        root = os.path.abspath(root)
+        found, rels = [], set()
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS)
+            for fn in sorted(filenames):
+                if fn.endswith(".py") and not any(fnmatch.fnmatch(fn, p) for p in EXCLUDE_FILES):
+                    rels.add(os.path.relpath(os.path.join(dirpath, fn), root).replace(os.sep, "/"))
+        for rel in sorted(rels):
+            try:
+                text = PythonBroker._read_source(os.path.join(root, rel))
+            except OSError:
+                continue
+            if not any(k in text for k in ("DJANGO_SETTINGS_MODULE", "ROOT_URLCONF", "INSTALLED_APPS")):
+                continue
+            try:
+                tree = ast.parse(text, filename=rel)
+            except (SyntaxError, ValueError, RecursionError):
+                continue
+            ref = DjangoAnalyzer.settings_module_reference(tree)
+            starters = ("execute_from_command_line", "get_wsgi_application", "get_asgi_application")
+            starter = any(isinstance(n, ast.Call) and (n.func.id if isinstance(n.func, ast.Name)
+                                                       else getattr(n.func, "attr", "")) in starters
+                          for n in ast.walk(tree))
+            if ref and starter:
+                found.append(dict(file=rel, role="process_entry", framework="django",
+                                  settings_module=ref[0], covered_by=None))
+                continue
+            names = set()
+            for st in _toplevel_stmts(tree.body):
+                if isinstance(st, ast.Assign):
+                    names.update(t.id for t in st.targets if isinstance(t, ast.Name))
+                elif isinstance(st, (ast.AugAssign, ast.AnnAssign)) and isinstance(st.target, ast.Name):
+                    names.add(st.target.id)
+            if names & {"ROOT_URLCONF", "INSTALLED_APPS"}:
+                found.append(dict(file=rel, role="configuration_root", framework="django",
+                                  settings_module=None, covered_by=None))
+        for p in (f for f in found if f["role"] == "process_entry" and f["settings_module"]):
+            parts = p["settings_module"].split(".")
+            for base in ("", posixpath.dirname(p["file"])):
+                for cand in (posixpath.join(base, *parts) + ".py", posixpath.join(base, *parts, "__init__.py")):
+                    for c in found:
+                        if (c["role"] == "configuration_root" and c["file"] == cand.lstrip("/")
+                                and c["covered_by"] is None):
+                            c["covered_by"] = p["file"]
+        return found
 
     # ------------------------------------------------------------------
     # Text-based (legacy) traversal: same outputs, lower confidence
@@ -2124,6 +2607,7 @@ class PythonBroker:
                 scope.local_funcs[stmt.name] = nid
         self._bind_local_imports(scope, sym)
         scope.bindings = self._function_bindings(sym)
+        self._apply_param_hints(scope, sym)
         for stmt in sym.node.body:
             Visitor(self, scope, depth).visit(stmt)
 
@@ -2169,6 +2653,7 @@ class PythonBroker:
                            type="CALLS", target=init, file=self.symbols[init].file,
                            line=self.symbols[init].line, already_visited=again)
                 self._edge(sym.id, init, "CALLS", self.symbols[init].line)
+                self._note_param_types(self.symbols[init], node, scope)
                 self.trace_symbol(init, depth + 2)
         else:
             again = sym.id in self.expanded
@@ -2178,6 +2663,7 @@ class PythonBroker:
                        + ("   (already expanded)" if again else ""),
                        type="CALLS", target=sym.id, file=scope.file, line=node.lineno,
                        target_file=sym.file, target_line=sym.line, already_visited=again)
+            self._note_param_types(sym, node, scope)
             self.trace_symbol(sym.id, depth + 1)
 
     def _show_inheritance(self, cls, depth):
@@ -2249,6 +2735,36 @@ class PythonBroker:
     # ------------------------------------------------------------------
     # Structured outputs
     # ------------------------------------------------------------------
+    def source_inventory(self):
+        """Complete inventory of EVERY discovered project source file with its original lines.
+
+        Independent of the execution trace: it is built from the repository index (``py_files`` /
+        ``sources``), so a file is listed whether or not it is imported, called or reached from the
+        entry point - parseable files and legacy (text-analysed) files alike.  Lines are the original
+        lines, numbered exactly like Python numbers them (see ``split_source_lines``); blank lines,
+        comments and docstrings are kept.  ``skipped`` lists files that were found but could not be
+        read.  Nothing here is derived from ``trace_entries``."""
+        if not self._index_ready:
+            self.index_repository()
+        files, total = [], 0
+        for rel in sorted(self.py_files):
+            src = self.sources.get(rel)
+            if src is None:
+                continue
+            lines = split_source_lines(src)
+            if lines and lines[-1] == "":        # a trailing newline ends the last line, it does not start a new one
+                lines.pop()
+            total += len(lines)
+            files.append(OrderedDict([
+                ("path", rel), ("module", self._module_of(rel)),
+                ("analysis_mode", self.analysis_mode.get(rel, ANALYSIS_AST)),
+                ("reached", rel in self.reached_files),
+                ("line_count", len(lines)), ("lines", lines)]))
+        skipped = [OrderedDict([("file", f), ("error", e)]) for f, e in self.parse_errors if f not in self.py_files]
+        return OrderedDict([("contract", "source_inventory/1"), ("files", files), ("skipped", skipped),
+                            ("stats", OrderedDict([("files", len(files)), ("lines", total),
+                                                   ("reached_files", sum(1 for x in files if x["reached"]))]))])
+
     def _module_of(self, rel):
         return rel[:-3].replace("/", ".") if rel.endswith(".py") else rel
 
@@ -2258,7 +2774,8 @@ class PythonBroker:
             if "<local>" in s.id and s.id not in self.reached:
                 continue
             key = s.id.split(":", 1)[1]
-            out[key + ("" if key not in out else f"@{s.file}")] = {
+            okey = key + ("" if key not in out else f"@{s.file}")
+            out[okey] = {
                 "module": self._module_of(s.file), "file": s.file, "line": s.line,
                 "type": s.kind,
                 "class": s.parent.split(":", 1)[1] if s.parent else None,
@@ -2268,6 +2785,8 @@ class PythonBroker:
                 "dispatch_target": s.id in self.dispatch_targets,
                 "reachability": self._reachability(s.id),
             }
+            if self.framework_info and self.framework_info.get("active"):    # additive: named by configuration
+                out[okey]["configured"] = s.id in self.arch_symbols
         return out
 
     def _reachability(self, sid):
@@ -2290,11 +2809,20 @@ class PythonBroker:
             e["file"] = src.file if src else e.get("file", self.entry)
         return {"nodes": list(self.nodes.values()), "edges": edges}
 
+    def _framework_files(self):
+        fi = self.framework_info
+        return set(fi["files"]) if fi and fi.get("active") else set()
+
     def architecture_json(self):
         arch = {}
-        for rel in sorted(self.reached_files):
+        fw = self._framework_files()
+        for rel in sorted(self.reached_files | fw):
             entry = {"module": self._module_of(rel), "classes": {}, "functions": {},
                      "imports": [{"alias": a, **i} for a, i in self.imports.get(rel, {}).items()]}
+            if fw:                                   # additive, only when a framework analysis ran
+                entry["execution_reached"] = rel in self.reached_files
+                entry["discovered_via"] = ([VIA_EXECUTION] if rel in self.reached_files else []) + \
+                    (self.framework_info["files"][rel]["discovered_via"] if rel in fw else [])
             for s in self.symbols.values():
                 if s.file != rel or "<local>" in s.id:
                     continue
@@ -2337,6 +2865,7 @@ class PythonBroker:
     # ------------------------------------------------------------------
     def _t(self, depth, file, line, text):
         self.trace.append(f"{'    ' * depth}{file}:{line:<4}| {text}")
+        self.trace_entries.append((depth, file, line, text))
 
     def _stmt_lines(self, rel, stmt):
         src = self.sources[rel].splitlines()
@@ -2393,27 +2922,30 @@ class PythonBroker:
                         for tg in stmt.targets:
                             if isinstance(tg, ast.Name):
                                 scope.vars[tg.id] = t
+                    else:
+                        self._bind_candidates(stmt.targets, stmt.value, scope)
 
     def _inline_calls(self, node, scope, depth, active):
         for call in self._calls_in(node):
             d = self.resolve_dispatch(call, scope)
             if d is not None:                              # indirect call: every possible target, once
                 for sid in OrderedDict((e[1], None) for e in d["entries"]):
-                    self._inline_symbol(self.symbols[sid], depth + 1, active)
+                    self._inline_target(self.symbols[sid], depth + 1, active)
                 continue
             t = self.resolve_expr(call.func, scope)
-            if not t or t.kind != "symbol":
-                continue
-            sym = self.symbols[t.ref]
-            target = sym
-            if sym.kind == "class":
-                init = self.find_method(sym.id, "__init__")
-                self._t(depth + 1, sym.file, sym.line,
-                        self.sources[sym.file].splitlines()[sym.line - 1].strip())
-                if not init:
-                    continue
-                target = self.symbols[init]
-            self._inline_symbol(target, depth + 1, active)
+            for t in ([t] if t else self.resolve_candidates(call.func, scope)):   # several possible values: all
+                if t.kind == "symbol":
+                    self._inline_target(self.symbols[t.ref], depth + 1, active)
+
+    def _inline_target(self, sym, depth, active):
+        """A class is entered through its __init__ (the class line is shown); anything else directly."""
+        if sym.kind == "class":
+            init = self.find_method(sym.id, "__init__")
+            self._t(depth, sym.file, sym.line, self.sources[sym.file].splitlines()[sym.line - 1].strip())
+            if not init:
+                return
+            sym = self.symbols[init]
+        self._inline_symbol(sym, depth, active)
 
     def _inline_symbol(self, sym, depth, active):
         if sym.id in active:
@@ -2428,6 +2960,7 @@ class PythonBroker:
         scope = Scope(sym.file, sym.parent if sym.kind == "method" else None, sym.id)
         self._bind_local_imports(scope, sym)
         scope.bindings = self._function_bindings(sym)
+        self._apply_param_hints(scope, sym)
         self.trace_body(sym.node.body, scope, depth + 1, active | {sym.id})
 
     def build_trace(self):
@@ -2486,65 +3019,113 @@ class PythonBroker:
                         target = self.symbols[init]
                     self._inline_symbol(target, depth + 1, set())
 
-    def write_outputs(self, outdir):
-        os.makedirs(outdir, exist_ok=True)
-        def dump(name, obj):
-            with open(os.path.join(outdir, name), "w", encoding="utf-8") as f:
-                json.dump(obj, f, indent=2)
-        dump("index.json", self.index_json())
-        dump("graph.json", self.graph_json())
-        dump("execution_tree.json", self.tree_root["children"])
-        dump("architecture_tree.json", self.architecture_json())
-        trace_text = self.build_trace()          # built exactly once (build_trace appends to self.trace)
-        with open(os.path.join(outdir, "expanded_trace.txt"), "w", encoding="utf-8") as f:
-            f.write(trace_text)
-        self.write_trace_tree(outdir, trace_text)
-        try:                                     # additive stage: must never break the existing outputs
-            self.analyze_functionalities(self.trace_tree_root)
-            dump("functionality.json", self.functionality_json())
-        except Exception:
-            import traceback
-            print("WARNING: functionality analysis failed; other outputs are unaffected.", file=sys.stderr)
-            traceback.print_exc()
-        try:                                     # additive stage #2: top-down extraction straight from the tree
-            if self.entry.endswith((".py", ".toml")) and self._declared_entry_points():
-                # a descriptor with declared entries: ALL of them hang below it (ROOT -> setup.py -> entries)
-                self.topdown_result = build_setup_hierarchy(self.root, self.entry, self.internal_hints, broker=self)
-            else:
-                self.topdown_result = extract_topdown_functionalities(
-                    self.trace_tree_root, project=os.path.basename(self.root) or self.root, entry_point=self.entry_label)
-            write_topdown_outputs(self.topdown_result, outdir)
-        except Exception:
-            import traceback
-            print("WARNING: top-down functionality extraction failed; other outputs are unaffected.", file=sys.stderr)
-            traceback.print_exc()
-        with open(os.path.join(outdir, "report.txt"), "w", encoding="utf-8") as f:
-            f.write(self.report())
+    # ------------------------------------------------------------------
+    # Normalised result (schema: normalized.py) and the hooks app_broker calls.  No file is written here.
+    # ------------------------------------------------------------------
+    LANGUAGE = "Python"
 
-    # ------------------------------------------------------------------
-    # Trace tree: expanded_trace.txt -> parse_trace() -> { JSON , SVG }
-    # ------------------------------------------------------------------
-    def write_trace_tree(self, outdir, trace_text):
-        root, stats = parse_trace(trace_text, self.call_sites)
-        doc = OrderedDict([
-            ("project", os.path.basename(self.root) or self.root),
-            ("entry_point", self.entry_label),
-            ("statistics", stats),
-            ("root", root),
-        ])
-        with open(os.path.join(outdir, "trace_tree.json"), "w", encoding="utf-8") as f:
-            json.dump(doc, f, indent=2)
-        with open(os.path.join(outdir, "trace_tree.svg"), "w", encoding="utf-8") as f:
-            f.write(render_trace_svg(doc))
-        self.trace_tree_stats = stats
-        self.trace_tree_root = root
-        print("PATCHPLUS TRACE TREE")
-        print("--------------------")
-        print(f"Trace entries        : {stats['trace_entries']}")
-        print(f"Code nodes           : {stats['code_nodes']}")
-        print(f"References           : {stats['references']}")
-        print(f"Maximum depth        : {stats['max_depth']}")
-        print(f"Root nodes           : {stats['root_nodes']}")
+    def normalized_result(self):
+        """Python-specific results -> the shared schema.  Built once (it also builds the execution trace,
+        after the graph / architecture data, exactly as the former write_outputs did)."""
+        if self._normalized is not None:
+            return self._normalized
+        info = self._ensure_entry()
+        fi = self.framework_info
+        fw_files = self._framework_files()
+        res = new_result(self.LANGUAGE, os.path.basename(self.root) or self.root, self.root,
+                         {"file": self.entry, "label": self.entry_label, "kind": info["kind"],
+                          "resolved_file": info["file"], "via": self._via_note(info) or None,
+                          "reason": info.get("reason")})
+        n_ast = len(self.files)
+        res["analysis"].update(
+            mode="text" if self.legacy_files and not n_ast else ("mixed" if self.legacy_files else "ast"),
+            partial=bool(self.legacy_files or self.parse_errors or self.framework_error),
+            text_files=sorted(self.legacy_files),
+            parse_errors=[{"file": f, "error": e} for f, e in self.parse_errors],
+            notes=[f"{f}: ast could not parse ({why})" for f, why in sorted(self.legacy_reasons.items())]
+                  + ([f"framework analysis failed: {self.framework_error}"] if self.framework_error else []))
+        for rel in sorted(self.reached_files | fw_files):
+            f = {"path": rel, "module": self._module_of(rel), "reached": rel in self.reached_files,
+                 "analysis_mode": ANALYSIS_TEXT if rel in self.legacy_files else ANALYSIS_AST}
+            if fw_files:
+                f["execution_reached"] = rel in self.reached_files
+                f["discovered_via"] = ([VIA_EXECUTION] if rel in self.reached_files else []) + \
+                    (fi["files"][rel]["discovered_via"] if rel in fw_files else [])
+            if rel in self.legacy_files:
+                ti = self.text_info[rel]
+                f["text_definitions"] = [{"name": d["name"], "kind": d["kind"], "line": d["line"],
+                                         "parent": d["parent"], "confidence": "low"} for d in ti["defs"]]
+                if ti["main"]:
+                    f["main_block_line"] = ti["main"]["line"]
+            res["files"].append(f)
+        configured = bool(fi and fi.get("active"))
+        for s in self.symbols.values():
+            d = {"id": s.id, "kind": s.kind, "name": s.name, "file": s.file, "line": s.line, "parent": s.parent,
+                 "module": self._module_of(s.file), "scope": "local" if "<local>" in s.id else "module",
+                 "reachable": s.id in self.reached, "referenced": s.id in self.referenced,
+                 "dispatch_target": s.id in self.dispatch_targets, "reachability": self._reachability(s.id),
+                 "confidence": "high"}
+            if configured:
+                d["configured"] = s.id in self.arch_symbols
+            res["symbols"].append(d)
+        for rel, table in self.imports.items():
+            res["imports"] = res.get("imports", []) + [{"file": rel, "alias": a, **i} for a, i in table.items()]
+        for e in self.edges.values():
+            src = self.symbols.get(e["source"])
+            res["relationships"].append({
+                "source": e["source"], "target": e["target"], "type": e["type"],
+                "origin": "framework" if e["type"] in ARCHITECTURE_EDGE_TYPES else "static",
+                "line": e.get("line"), "file": src.file if src else e.get("file", self.entry),
+                "attributes": {k: v for k, v in e.items() if k not in ("source", "target", "type", "line")}})
+        res["nodes"] = [dict(n) for n in self.nodes.values()]
+        res["execution_tree"] = self.tree_root["children"]
+        res["dependencies"] = [{"module": m, "category": cat, "references": sorted(lbl)}
+                               for cat, tbl in (("external", self.external_calls), ("stdlib", self.stdlib_calls),
+                                                ("missing", self.missing_calls)) for m, lbl in sorted(tbl.items())]
+        res["unresolved"] = [{"file": f, "line": l, "reference": r, "reason": why}
+                             for (f, l, r), why in self.unresolved.items()]
+        if fi is not None:
+            res["framework"] = {"name": fi.get("framework"), "active": bool(fi.get("active")), "document": fi}
+        res["extensions"] = {"python": {
+            "internal_hints": sorted(self.internal_hints),
+            "fallback_resolutions": [{"module": m, "from": f, "target": t}
+                                     for (m, f), t in sorted(self.fallback_resolutions.items())]}}
+        self.build_trace()                      # built exactly once (appends to self.trace / self.trace_entries)
+        res["trace"] = {"entries": [{"depth": d, "file": f, "line": l, "text": t} for d, f, l, t in self.trace_entries],
+                        "call_categories": [{"file": f, "line": l, "category": k}
+                                            for (f, l), k in self.call_sites.items()]}
+        # complete source inventory: separate from (and not limited to) the execution trace above
+        res["extensions"]["python"]["source_inventory"] = self.source_inventory()
+        self._normalized = res
+        return res
+
+    def attach_trace_tree(self, root, stats):
+        """app_broker built the trace tree from the normalised trace; the Python analyses reuse it."""
+        self.trace_tree_root, self.trace_tree_stats = root, stats
+
+    def functionality_document(self):
+        self.analyze_functionalities(self.trace_tree_root)
+        return self.functionality_json()
+
+    def topdown_document(self):
+        if self.entry.endswith((".py", ".toml")) and self._declared_entry_points():
+            # a descriptor with declared entries: ALL of them hang below it (ROOT -> setup.py -> entries)
+            result = build_setup_hierarchy(self.root, self.entry, self.internal_hints, broker=self)
+        else:
+            result = extract_topdown_functionalities(
+                self.trace_tree_root, project=os.path.basename(self.root) or self.root, entry_point=self.entry_label)
+        self.topdown_result = result
+        return {"result": result, "text": render_topdown_text(result)}
+
+    @staticmethod
+    def topdown_from_trace(doc):
+        """``--from-trace``: top-down extraction from an existing trace_tree.json document (no repository analysis)."""
+        result = extract_topdown_functionalities(doc["root"], project=doc.get("project", ""),
+                                                 entry_point=doc.get("entry_point", ""))
+        return {"result": result, "text": render_topdown_text(result)}
+
+    def report_text(self):
+        return self.report()
 
     # ------------------------------------------------------------------
     # Functionality extraction: trace tree -> functionality.json
@@ -3254,7 +3835,7 @@ class PythonBroker:
 
         o += [bar, "10. OUTPUT FILES", bar,
               "  index.json, graph.json, execution_tree.json, architecture_tree.json, expanded_trace.txt,",
-              "  trace_tree.json, trace_tree.svg, functionality.json,",
+              "  trace_tree.json, trace_tree.svg, source_tree.svg, functionality.json,",
               "  topdown_functionalities.json, topdown_functionalities.txt", ""]
         st = self.trace_tree_stats
         if st:
@@ -3273,81 +3854,8 @@ class PythonBroker:
                   f"Child operations     : {ts['child_operations']}",
                   f"Code nodes accounted : {ts['code_nodes_accounted']} / {ts['code_nodes']}",
                   f"Maximum path depth   : {ts['max_path_depth']}", ""]
+        o += framework_report_lines(self.framework_info)       # additive section; empty without a framework analysis
         return "\n".join(o)
-
-
-# ----------------------------------------------------------------------
-# Trace tree
-#
-#   expanded_trace.txt --parse_trace()--> tree --+--> trace_tree.json
-#                                                 +--> trace_tree.svg
-#
-# The tree is built ONLY from the trace (indentation = parent/child).  Every
-# trace line that carries code becomes its own node - the same file:line
-# reached twice is two nodes, because each is a different point in the
-# traversal.  "(expanded above)" / "(recursive call ...)" lines are not code;
-# they are stored as `references` on the node they belong to.
-# ----------------------------------------------------------------------
-_TRACE_RE = re.compile(r"^( *)(\S.*?):(\d+)\s*\|\s?(.*)$")
-_REF_EXPANDED = "(expanded above)"
-_REF_RECURSIVE = "(recursive call to"
-
-
-def parse_trace(text, call_sites=None):
-    """Turn expanded_trace.txt text into (root_node, statistics). Fails loudly on bad input."""
-    call_sites = call_sites or {}
-    root = OrderedDict([("id", "root"), ("type", "root"), ("children", [])])
-    stack = []                       # [(indent, node)] - the currently open ancestors
-    entries = code_nodes = references = max_depth = 0
-
-    for lineno, raw in enumerate(text.splitlines(), 1):
-        if not raw.strip():
-            continue
-        m = _TRACE_RE.match(raw.expandtabs(4))
-        if not m:
-            raise ValueError(f"expanded_trace.txt line {lineno} is not 'file:line | code': {raw!r}")
-        entries += 1
-        indent, file, line, code = len(m.group(1)), m.group(2).strip(), int(m.group(3)), m.group(4).strip()
-
-        # indentation-relative (no fixed width assumed): close every open node at this indent or deeper
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        parent = stack[-1][1] if stack else root
-
-        if code == _REF_EXPANDED or code.startswith(_REF_RECURSIVE):
-            parent.setdefault("references", []).append(OrderedDict([
-                ("type", "reference"),
-                ("target", f"{file}:{line}"),
-                ("status", "expanded_above" if code == _REF_EXPANDED else "recursive_call"),
-            ]))
-            references += 1
-            continue
-
-        code_nodes += 1
-        node = OrderedDict([("id", f"node_{code_nodes:06d}"), ("type", "code"),
-                            ("file", file), ("line", line), ("code", code)])
-        kind = call_sites.get((file, line))
-        if kind:
-            node["category"] = kind           # only present for external / stdlib call lines
-        node["children"] = []
-        parent["children"].append(node)
-        stack.append((indent, node))
-        max_depth = max(max_depth, len(stack))
-
-    # validation: every trace entry is exactly one code node or one reference
-    walked = 0
-    todo = list(root["children"])
-    while todo:
-        n = todo.pop()
-        walked += 1
-        todo.extend(n["children"])
-    if walked != code_nodes or code_nodes + references != entries:
-        raise ValueError(f"trace tree validation failed: entries={entries} code={code_nodes} "
-                         f"refs={references} walked={walked}")
-    stats = OrderedDict([("trace_entries", entries), ("code_nodes", code_nodes),
-                         ("references", references), ("max_depth", max_depth),
-                         ("root_nodes", len(root["children"]))])
-    return root, stats
 
 
 # ----------------------------------------------------------------------
@@ -3673,21 +4181,6 @@ def render_topdown_text(result):
     return "\n".join(o)
 
 
-def write_topdown_outputs(result, outdir):
-    os.makedirs(outdir, exist_ok=True)
-    with open(os.path.join(outdir, "topdown_functionalities.json"), "w", encoding="utf-8") as fh:
-        json.dump(result, fh, indent=2, ensure_ascii=False)
-    with open(os.path.join(outdir, "topdown_functionalities.txt"), "w", encoding="utf-8") as fh:
-        fh.write(render_topdown_text(result))
-    st = result["statistics"]
-    print("PATCHPLUS TOP-DOWN FUNCTIONALITY EXTRACTION")
-    print("-------------------------------------------")
-    print(f"Functionalities      : {st['functionalities']}")
-    print(f"Child operations     : {st['child_operations']}")
-    print(f"Code nodes accounted : {st['code_nodes_accounted']} / {st['code_nodes']}")
-    print(f"Maximum path depth   : {st['max_path_depth']}")
-
-
 def _merge_hierarchy_statistics(h):
     """Statistics of a hierarchy in the shape the single-entry result (and report()) already uses."""
     fs = h["functionalities"]
@@ -3731,178 +4224,993 @@ def build_setup_hierarchy(root, descriptor, internal_hints, broker=None):
     return result
 
 
-# SVG look: left-to-right tree, dark rounded cards, accent bar on the left,
-# orthogonal connectors with arrowheads.
-_SVG = dict(W=200, H=80, COL=280, ROW=100, PAD=40, GAP_LINES=3, CODE_CHARS=25,
-            FONT="Consolas, 'SFMono-Regular', Menlo, 'DejaVu Sans Mono', monospace")
-_ACCENT = {"code": "#38bdf8", "external": "#f59e0b", "stdlib": "#34d399"}
-_XML_BAD = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# ======================================================================
+# Framework / configuration-driven architecture traversal
+#
+# Execution tracing (above) follows CALLS.  Frameworks wire applications together through
+# configuration values instead: a settings module names its URL module as a string, URL modules
+# `include()` other URL modules by dotted name and hand view references to `path()`, settings list
+# application packages and middleware classes as strings.  None of that is a call into project code,
+# so none of it is reached by the execution trace.
+#
+# This layer reads those relationships STATICALLY (AST only; no repository code is imported or run)
+# and records them as explicit architecture edges in the same graph.  It never touches
+# `reached` / `reached_files` / `expanded` and never writes into the execution tree or trace, so
+# execution statistics are unaffected.  Anything that cannot be resolved is reported as unresolved
+# (with a reason) or external - a target is never invented.
+# ======================================================================
+EDGE_CONFIGURES = "CONFIGURES"
+EDGE_REGISTERS_APP = "REGISTERS_APP"
+EDGE_INCLUDES_URLS = "INCLUDES_URLS"
+EDGE_ROUTES_TO = "ROUTES_TO"
+EDGE_USES_MIDDLEWARE = "USES_MIDDLEWARE"
+EDGE_IMPORTS = "IMPORTS"
+ARCHITECTURE_EDGE_TYPES = (EDGE_CONFIGURES, EDGE_REGISTERS_APP, EDGE_INCLUDES_URLS, EDGE_ROUTES_TO,
+                           EDGE_USES_MIDDLEWARE, EDGE_IMPORTS)
+
+VIA_EXECUTION = "execution"
+VIA_IMPORT = "import"                        # imported by an execution-reached file (no call needed)
+VIA_CONFIGURATION = "configuration"          # named by configuration / registration
+VIA_ARCH_IMPORT = "architecture_import"      # imported (bounded depth) by a configuration-discovered file
 
 
-def _x(s):
-    return _xml_escape(_XML_BAD.sub("", str(s)))
+class _Item:
+    """One statically known value (or the reason it is not known)."""
+    __slots__ = ("kind", "value", "node", "file", "line", "conditional", "reason")
+
+    def __init__(self, kind, value=None, node=None, file=None, line=None, conditional=False, reason=None):
+        # kind: str | other | call | dict | dyn | module | external
+        self.kind, self.value, self.node, self.file = kind, value, node, file
+        self.line, self.conditional, self.reason = line, conditional, reason
 
 
-# Zoom / pan UI embedded in trace_tree.svg (works when the SVG is opened directly in a browser;
-# viewers that ignore <script> just show the static, fit-to-window tree).
-_SVG_CONTROLS = r'''<g id="hud" font-family="Arial, Helvetica, sans-serif" font-size="14">
-  <g data-act="in"><rect width="32" height="28" rx="6" fill="#161f33" stroke="#4b5a73"/><text x="16" y="19" text-anchor="middle" fill="#fff" font-size="18">+</text></g>
-  <g data-act="out" transform="translate(38 0)"><rect width="32" height="28" rx="6" fill="#161f33" stroke="#4b5a73"/><text x="16" y="19" text-anchor="middle" fill="#fff" font-size="18">&#8722;</text></g>
-  <g data-act="fit" transform="translate(76 0)"><rect width="44" height="28" rx="6" fill="#161f33" stroke="#4b5a73"/><text x="22" y="19" text-anchor="middle" fill="#fff">Fit</text></g>
-  <g data-act="actual" transform="translate(126 0)"><rect width="52" height="28" rx="6" fill="#161f33" stroke="#4b5a73"/><text x="26" y="19" text-anchor="middle" fill="#fff">100%</text></g>
-  <text x="0" y="46" font-size="11" fill="#64748b">wheel = zoom &#183; drag = pan &#183; + / - / 0 (fit) / 1 (100%)</text>
-</g>
-<script type="text/ecmascript"><![CDATA[
-(function () {
-  var svg = document.documentElement, vp = document.getElementById('viewport'),
-      hud = document.getElementById('hud'), s = {k: 1, x: 0, y: 0}, MIN = 0.02, MAX = 8;
-  function base() { return svg.getScreenCTM(); }
-  function toUser(cx, cy) { var p = svg.createSVGPoint(); p.x = cx; p.y = cy; return p.matrixTransform(base().inverse()); }
-  function placeHud() {
-    var m = base(), r = svg.getBoundingClientRect(), u = toUser(r.left + 12, r.top + 12);
-    hud.setAttribute('transform', 'translate(' + u.x + ' ' + u.y + ') scale(' + (1 / m.a) + ')');
-  }
-  function apply() { vp.setAttribute('transform', 'translate(' + s.x + ' ' + s.y + ') scale(' + s.k + ')'); placeHud(); }
-  function zoomAt(cx, cy, f) {
-    var u = toUser(cx, cy), k = Math.min(MAX, Math.max(MIN, s.k * f)); f = k / s.k;
-    s.x = u.x - (u.x - s.x) * f; s.y = u.y - (u.y - s.y) * f; s.k = k; apply();
-  }
-  function zoomCentre(f) { var r = svg.getBoundingClientRect(); zoomAt(r.left + r.width / 2, r.top + r.height / 2, f); }
-  function fit() { s = {k: 1, x: 0, y: 0}; apply(); }
-  function actual() {          /* 1 svg px = 1 screen px, root card at the left, vertically centred */
-    var r = svg.getBoundingClientRect(), k = 1 / base().a, t = toUser(r.left + 40, r.top + r.height / 2);
-    s.k = k; s.x = t.x - k * parseFloat(svg.getAttribute('data-root-x'));
-    s.y = t.y - k * parseFloat(svg.getAttribute('data-root-y')); apply();
-  }
-  svg.addEventListener('wheel', function (e) { e.preventDefault(); zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015)); }, {passive: false});
-  var drag = null;
-  svg.addEventListener('pointerdown', function (e) {
-    if (hud.contains(e.target)) return;
-    drag = {x: e.clientX, y: e.clientY}; svg.setPointerCapture(e.pointerId); svg.style.cursor = 'grabbing';
-  });
-  svg.addEventListener('pointermove', function (e) {
-    if (!drag) return; var a = base().a;
-    s.x += (e.clientX - drag.x) / a; s.y += (e.clientY - drag.y) / a; drag = {x: e.clientX, y: e.clientY}; apply();
-  });
-  function up() { drag = null; svg.style.cursor = 'grab'; }
-  svg.addEventListener('pointerup', up); svg.addEventListener('pointercancel', up);
-  hud.addEventListener('click', function (e) {
-    var g = e.target; while (g && g !== hud && !g.getAttribute('data-act')) g = g.parentNode;
-    var a = g && g.getAttribute && g.getAttribute('data-act');
-    if (a === 'in') zoomCentre(1.25); else if (a === 'out') zoomCentre(0.8);
-    else if (a === 'fit') fit(); else if (a === 'actual') actual();
-  });
-  document.addEventListener('keydown', function (e) {
-    if (e.key === '+' || e.key === '=') zoomCentre(1.25); else if (e.key === '-') zoomCentre(0.8);
-    else if (e.key === '0') fit(); else if (e.key === '1') actual();
-  });
-  window.addEventListener('resize', placeHud);
-  actual();
-})();
-]]></script>'''
+class _Seq(list):
+    """A statically evaluated list / tuple / set of _Item."""
 
 
-def render_trace_svg(doc):
-    """Render the tree held in `doc` (the same dict that is written to JSON) as an SVG string."""
-    c = _SVG
-    W, H, COL, ROW, PAD = c["W"], c["H"], c["COL"], c["ROW"], c["PAD"]
-    root = doc["root"]
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), 10000))
+def _const_str(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
-    # --- layout: x by depth, leaves stacked top-to-bottom, parents centred on children
-    pos, cursor, max_depth = {}, [0], [0]
 
-    def place(n, depth):
-        max_depth[0] = max(max_depth[0], depth)
-        kids = n["children"]
-        if not kids:
-            cy = PAD + cursor[0] * ROW + H / 2
-            cursor[0] += 1
+def _toplevel_stmts(body):
+    """Module-level statements, descending into if / try / with (not into def / class)."""
+    for st in body:
+        yield st
+        if isinstance(st, ast.If):
+            yield from _toplevel_stmts(st.body)
+            yield from _toplevel_stmts(st.orelse)
+        elif isinstance(st, ast.Try):
+            yield from _toplevel_stmts(st.body)
+            for h in st.handlers:
+                yield from _toplevel_stmts(h.body)
+            yield from _toplevel_stmts(st.orelse)
+            yield from _toplevel_stmts(st.finalbody)
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            yield from _toplevel_stmts(st.body)
+
+
+class _StaticConfig:
+    """Module-level constant evaluator: no execution, no imports of repository code.
+
+    Handles string literals, lists / tuples / sets, `+` and `+=`, `.append` / `.extend`, names, imported
+    names (from other repository modules, incl. `from x import *`), if / else and try / except (branches
+    are unioned and flagged `conditional`).  Everything else becomes a `dyn` item carrying a reason."""
+    _MAX_DEPTH = 40
+
+    def __init__(self, broker):
+        self.b = broker
+        self._envs = {}
+        self._busy = set()
+
+    # -- environments ---------------------------------------------------
+    def module_env(self, rel):
+        if rel in self._envs:
+            return self._envs[rel]
+        if rel in self._busy:                    # import cycle: the partial environment is empty
+            return {}
+        tree = self.b.files.get(rel)
+        if tree is None:
+            self._envs[rel] = {}
+            return {}
+        self._busy.add(rel)
+        env = {}
+        try:
+            self._exec(rel, tree.body, env, False)
+        finally:
+            self._busy.discard(rel)
+        self._envs[rel] = env
+        return env
+
+    def _exec(self, rel, body, env, cond):
+        for st in body:
+            if isinstance(st, ast.Assign):
+                val = self.eval(st.value, rel, env, cond)
+                for t in st.targets:
+                    if isinstance(t, ast.Name):
+                        env[t.id] = val
+            elif isinstance(st, ast.AnnAssign) and st.value is not None and isinstance(st.target, ast.Name):
+                env[st.target.id] = self.eval(st.value, rel, env, cond)
+            elif isinstance(st, ast.AugAssign) and isinstance(st.op, ast.Add) and isinstance(st.target, ast.Name):
+                cur = self._lookup(st.target.id, rel, env, cond, st)
+                env[st.target.id] = self._concat(cur, self.eval(st.value, rel, env, cond), rel, st, cond)
+            elif (isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+                  and isinstance(st.value.func, ast.Attribute) and isinstance(st.value.func.value, ast.Name)
+                  and st.value.func.attr in ("append", "extend", "insert")):
+                self._mutate(st.value, rel, env, cond)
+            elif isinstance(st, ast.ImportFrom) and any(a.name == "*" for a in st.names):
+                target = self.b._strict_module_file(st.module or "", st.level, rel)
+                if target:
+                    env.update(self.module_env(target))
+            elif isinstance(st, ast.If):
+                self._exec_branches(rel, [st.body, st.orelse], env)
+            elif isinstance(st, ast.Try):
+                self._exec_branches(rel, [st.body + st.orelse] + [h.body for h in st.handlers], env)
+                self._exec(rel, st.finalbody, env, True)
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                self._exec(rel, st.body, env, cond)
+
+    def _exec_branches(self, rel, branches, env):
+        envs = []
+        for br in branches:
+            e = dict(env)
+            self._exec(rel, br, e, True)
+            envs.append(e)
+        merged = {}
+        for name in {n for e in envs for n in e}:
+            vals, seen = [], set()
+            for e in envs:
+                if name in e and id(e[name]) not in seen:
+                    seen.add(id(e[name]))
+                    vals.append(e[name])
+            if len(vals) == 1:
+                merged[name] = vals[0]
+                continue
+            out, ids = _Seq(), set()
+            for v in vals:
+                for it in (v if isinstance(v, _Seq) else [v]):
+                    if id(it) not in ids:
+                        ids.add(id(it))
+                        out.append(it)
+            merged[name] = out
+        env.clear()
+        env.update(merged)
+
+    def _mutate(self, call, rel, env, cond):
+        name = call.func.value.id
+        cur = self._lookup(name, rel, env, cond, call)
+        cur = cur if isinstance(cur, _Seq) else _Seq([cur])
+        if call.func.attr == "append" and call.args:
+            env[name] = _Seq(list(cur) + [self._elem(call.args[0], rel, env, cond)])
+        elif call.func.attr == "extend" and call.args:
+            env[name] = self._concat(cur, self.eval(call.args[0], rel, env, cond), rel, call, cond)
+        elif call.func.attr == "insert" and len(call.args) == 2:
+            new = list(cur)
+            idx = call.args[0].value if isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, int) else 0
+            new.insert(idx, self._elem(call.args[1], rel, env, cond))
+            env[name] = _Seq(new)
+
+    # -- expressions ----------------------------------------------------
+    def _dyn(self, node, rel, cond, reason):
+        return _Item("dyn", None, node, rel, getattr(node, "lineno", None), cond, reason)
+
+    def _as_seq(self, v):
+        return v if isinstance(v, _Seq) else _Seq([v])
+
+    def _concat(self, left, right, rel, node, cond):
+        if left is None:
+            left = _Seq([self._dyn(node, rel, cond, "left operand is not statically known")])
+        return _Seq(list(self._as_seq(left)) + list(self._as_seq(right)))
+
+    def _elem(self, el, rel, env, cond):
+        if isinstance(el, ast.Call):
+            return _Item("call", None, el, rel, el.lineno, cond)
+        v = self.eval(el, rel, env, cond)
+        return v
+
+    def eval(self, e, rel, env, cond, depth=0):
+        if depth > self._MAX_DEPTH:
+            return self._dyn(e, rel, cond, "expression nesting too deep")
+        if isinstance(e, ast.Constant):
+            return _Item("str" if isinstance(e.value, str) else "other", e.value, e, rel, e.lineno, cond)
+        if isinstance(e, (ast.List, ast.Tuple, ast.Set)):
+            out = _Seq()
+            for el in e.elts:
+                if isinstance(el, ast.Starred):
+                    out.extend(self._as_seq(self.eval(el.value, rel, env, cond, depth + 1)))
+                else:
+                    v = self._elem(el, rel, env, cond)
+                    out.extend(v) if isinstance(v, _Seq) else out.append(v)
+            return out
+        if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add):
+            l, r = self.eval(e.left, rel, env, cond, depth + 1), self.eval(e.right, rel, env, cond, depth + 1)
+            if (isinstance(l, _Item) and isinstance(r, _Item) and l.kind == "str" and r.kind == "str"):
+                return _Item("str", l.value + r.value, e, rel, e.lineno, cond)
+            return _Seq(list(self._as_seq(l)) + list(self._as_seq(r)))
+        if isinstance(e, ast.Name):
+            return self._lookup(e.id, rel, env, cond, e)
+        if isinstance(e, ast.Attribute):
+            return self._attr_value(e, rel, cond)
+        if isinstance(e, ast.IfExp):
+            a, b = self.eval(e.body, rel, env, True, depth + 1), self.eval(e.orelse, rel, env, True, depth + 1)
+            return _Seq(list(self._as_seq(a)) + list(self._as_seq(b)))
+        if isinstance(e, ast.Dict):
+            return _Item("dict", None, e, rel, e.lineno, cond)
+        if isinstance(e, ast.Call):
+            fn = e.func.id if isinstance(e.func, ast.Name) else (e.func.attr if isinstance(e.func, ast.Attribute) else "")
+            if fn in ("list", "tuple", "set", "sorted") and len(e.args) == 1 and not e.keywords:
+                return self.eval(e.args[0], rel, env, cond, depth + 1)
+            if fn == "patterns" and e.args:                       # old django.conf.urls.patterns(prefix, *urls)
+                return _Seq(self._elem(a, rel, env, cond) for a in e.args[1:])
+            return self._dyn(e, rel, cond, f"call to {ast.unparse(e.func)}() is evaluated at runtime")
+        return self._dyn(e, rel, cond, f"{type(e).__name__} expression cannot be evaluated statically")
+
+    def _lookup(self, name, rel, env, cond, node):
+        if name in env:
+            return env[name]
+        imp = self.b.imports.get(rel, {}).get(name)
+        if imp:
+            target = self.b._strict_module_file(imp["module"], imp["level"], rel)
+            if imp["name"] is None:
+                return (_Item("module", target, node, rel, imp["line"], cond) if target
+                        else _Item("external", imp["module"], node, rel, imp["line"], cond))
+            if target:
+                tenv = self.module_env(target)
+                if imp["name"] in tenv:
+                    return tenv[imp["name"]]
+                return self._dyn(node, rel, cond, f"'{imp['name']}' is not a statically known value in {target}")
+            return _Item("external", f"{imp['module']}.{imp['name']}", node, rel, imp["line"], cond)
+        return self._dyn(node, rel, cond, f"name '{name}' is not statically known")
+
+    def _attr_value(self, e, rel, cond):
+        chain = []
+        n = e
+        while isinstance(n, ast.Attribute):
+            chain.append(n.attr)
+            n = n.value
+        if isinstance(n, ast.Name):
+            base = self._lookup(n.id, rel, {}, cond, n)
+            if isinstance(base, _Item) and base.kind == "module":
+                cur = base.value
+                for attr in reversed(chain[1:]):
+                    nxt = self.b._submodule_file(cur, attr)
+                    if nxt is None:
+                        break
+                    cur = nxt
+                else:
+                    tenv = self.module_env(cur)
+                    if chain[0] in tenv:
+                        return tenv[chain[0]]
+        return self._dyn(e, rel, cond, f"attribute '{ast.unparse(e)}' cannot be evaluated statically")
+
+
+class FrameworkAnalyzer:
+    """Base class of a framework-aware architecture analyzer.  A subclass recognises its framework from
+    the selected entry file (`detect`) and then records configuration relationships on the broker
+    (`analyze`).  Register new frameworks in FRAMEWORK_ANALYZERS."""
+    framework = None
+
+    def __init__(self, broker):
+        self.b = broker
+        self.cfg = _StaticConfig(broker)
+
+    def detect(self):                       # -> seed dict | None
+        raise NotImplementedError
+
+    def analyze(self, seed):                # -> JSON-serialisable dict
+        raise NotImplementedError
+
+
+class DjangoAnalyzer(FrameworkAnalyzer):
+    """Django: DJANGO_SETTINGS_MODULE -> settings -> ROOT_URLCONF -> nested include() -> views, plus
+    INSTALLED_APPS and MIDDLEWARE.  Four roles are kept apart and never substituted for each other:
+
+      process entry         manage.py / wsgi.py / asgi.py (names DJANGO_SETTINGS_MODULE)
+      configuration root    the settings module (defines ROOT_URLCONF / INSTALLED_APPS / MIDDLEWARE)
+      request-routing root  the module named by ROOT_URLCONF
+      registered apps       packages listed in INSTALLED_APPS"""
+    framework = "django"
+    SETTINGS_SIGNALS = ("ROOT_URLCONF", "INSTALLED_APPS", "MIDDLEWARE", "MIDDLEWARE_CLASSES")
+    DOTTED_SETTINGS = ("WSGI_APPLICATION", "ASGI_APPLICATION", "AUTHENTICATION_BACKENDS")
+    HANDLERS = ("handler400", "handler403", "handler404", "handler500")
+    URL_FUNCS = ("path", "re_path", "url")
+
+    def __init__(self, broker):
+        super().__init__(broker)
+        self.files = OrderedDict()           # rel -> {"via": [...], "reasons": [...], "depth": n}
+        self.unresolved, self.external = [], []
+        self.apps, self.middleware, self.other_settings = [], [], []
+        self.includes, self.routes, self.handlers, self.cycles = [], [], [], []
+        self.settings_imports = []
+        self._url_stack, self._url_done = [], set()
+        self._seen_unres = set()
+        self.capped = False
+
+    # -- seed -----------------------------------------------------------
+    @staticmethod
+    def settings_module_reference(tree):
+        """(dotted | None, line, expression text) when the file sets DJANGO_SETTINGS_MODULE, else None."""
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in ("setdefault", "putenv") and len(n.args) >= 2
+                    and _const_str(n.args[0]) == "DJANGO_SETTINGS_MODULE"):
+                return _const_str(n.args[1]), n.lineno, ast.unparse(n.args[1])
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Subscript) and _const_str(t.slice) == "DJANGO_SETTINGS_MODULE":
+                        return _const_str(n.value), n.lineno, ast.unparse(n.value)
+        return None
+
+    def detect(self):
+        b = self.b
+        if b.entry not in b.files:
+            return None
+        ref = self.settings_module_reference(b.files[b.entry])
+        if ref:
+            return {"role": "process_entry", "settings_ref": ref}
+        env = self.cfg.module_env(b.entry)
+        if any(n in env for n in self.SETTINGS_SIGNALS):
+            return {"role": "configuration_root"}
+        if "urlpatterns" in env:
+            return {"role": "request_routing_root"}
+        return None
+
+    # -- recording helpers ----------------------------------------------
+    def _add_file(self, rel, via, reason=None, depth=0):
+        d = self.files.setdefault(rel, {"via": [], "reasons": [], "depth": depth})
+        if via not in d["via"]:
+            d["via"].append(via)
+        if reason and reason not in d["reasons"]:
+            d["reasons"].append(reason)
+        d["depth"] = min(d["depth"], depth)
+
+    def _edge(self, src_file, tgt, etype, line, tgt_is_file=True, **attrs):
+        b = self.b
+        s = f"file:{src_file}"
+        b._node(s, "file", src_file)
+        if tgt_is_file:
+            t = f"file:{tgt}"
+            b._node(t, "file", tgt)
         else:
-            for k in kids:
-                place(k, depth + 1)
-            cy = (pos[kids[0]["id"]][1] + pos[kids[-1]["id"]][1]) / 2
-        pos[n["id"]] = (PAD + depth * COL, cy)
+            t = tgt
+            sym = b.symbols.get(tgt)
+            b._node(t, sym.kind if sym else "symbol", sym.file if sym else None, sym.line if sym else None)
+        b._edge(s, t, etype, line, origin="architecture", resolution="resolved", confidence="high",
+                file=src_file, **attrs)
 
-    place(root, 0)
-    width = PAD * 2 + max_depth[0] * COL + W
-    height = PAD * 2 + max(cursor[0], 1) * ROW - (ROW - H)
+    def _unres(self, category, reference, reason, file, line, setting=None):
+        key = (category, reference, reason, file, line)
+        if key in self._seen_unres:
+            return
+        self._seen_unres.add(key)
+        self.unresolved.append(OrderedDict(category=category, reference=reference, reason=reason,
+                                           file=file, line=line, setting=setting))
 
-    rx, ry = pos["root"]
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" '
-           f'viewBox="0 0 {width} {height}" font-family="{_x(c["FONT"])}" '
-           f'data-root-x="{rx:g}" data-root-y="{ry:g}" style="touch-action:none;cursor:grab">',
-           f'<title>PatchPlus trace tree - {_x(doc.get("project", ""))} ({_x(doc.get("entry_point", ""))})</title>',
-           '<defs><marker id="arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" '
-           'markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#64748b"/></marker></defs>',
-           f'<rect width="{width}" height="{height}" fill="#ffffff"/>']
+    def _ext(self, reference, file, line, setting=None, reason="third-party / non-repository module"):
+        self.external.append(OrderedDict(reference=reference, reason=reason, file=file, line=line, setting=setting))
 
-    out.append('<g id="viewport">')
-    # --- connectors
-    edges = []
-    todo = [root]
-    while todo:
-        n = todo.pop()
-        kids = n["children"]
-        if not kids:
-            continue
-        px, py = pos[n["id"]]
-        px += W
-        mid = px + (COL - W) / 2
-        ys = [pos[k["id"]][1] for k in kids]
-        trunk = f"M{px:g},{py:g}H{mid:g}"
-        if len(kids) > 1:
-            trunk += f"M{mid:g},{min(ys):g}V{max(ys):g}"
-        edges.append(f'<path d="{trunk}"/>')
-        for k in kids:
-            kx, ky = pos[k["id"]]
-            edges.append(f'<path d="M{mid:g},{ky:g}H{kx:g}" marker-end="url(#arrow)"/>')
-            todo.append(k)
-    out.append('<g fill="none" stroke="#64748b" stroke-width="2" stroke-linejoin="round">')
-    out.extend(edges)
-    out.append('</g>')
+    def _item_problem(self, it, setting, reference=None):
+        """Record a non-string settings item (dynamic / call / ...) as unresolved with its reason."""
+        reason = it.reason or (f"call to {ast.unparse(it.node.func)}() is evaluated at runtime"
+                               if it.kind == "call" else f"{it.kind} value cannot be used as a dotted path")
+        ref = reference or (ast.unparse(it.node) if it.node is not None else setting)
+        self._unres("dynamic", ref, reason, it.file, it.line, setting)
 
-    # --- nodes
-    def card(n, label, code, category, tip):
-        x, cy = pos[n["id"]]
-        y = cy - H / 2
-        accent = _ACCENT[category]
-        tag = {"external": "EXTERNAL", "stdlib": "STDLIB"}.get(category, "")
-        lab_max = 17 if tag else 29
-        if len(label) > lab_max:
-            label = "\u2026" + label[-(lab_max - 1):]
-        n_chars = c["CODE_CHARS"]
-        chunks = [code[i:i + n_chars] for i in range(0, len(code), n_chars)] or [""]
-        if len(chunks) > c["GAP_LINES"]:
-            chunks = chunks[:c["GAP_LINES"]]
-            chunks[-1] = chunks[-1][:-1] + "\u2026"
-        s = [f'<g data-id="{n["id"]}" data-category="{category}"><title>{_x(tip)}</title>',
-             f'<rect x="{x:g}" y="{y:g}" width="{W}" height="{H}" rx="8" fill="#161f33" stroke="#4b5a73" stroke-width="1.5"/>',
-             f'<rect x="{x:g}" y="{y:g}" width="6" height="{H}" rx="3" fill="{accent}"/>',
-             f'<text x="{x + 16:g}" y="{y + 20:g}" font-size="10" fill="#7dd3fc" xml:space="preserve">{_x(label)}</text>']
-        if tag:
-            s.append(f'<text x="{x + W - 10:g}" y="{y + 20:g}" font-size="8" text-anchor="end" '
-                     f'fill="{accent}" font-weight="700">{tag}</text>')
-        for i, ch in enumerate(chunks):
-            s.append(f'<text x="{x + 16:g}" y="{y + 40 + i * 14:g}" font-size="11" font-weight="600" '
-                     f'fill="#ffffff" xml:space="preserve">{_x(ch)}</text>')
-        s.append('</g>')
-        return "".join(s)
+    def _classify_missing(self, dotted, file):
+        top = dotted.split(".")[0]
+        if self.b._strict_module_file(top, 0, file) is not None or top in self.b.internal_hints:
+            return "missing", (f"'{dotted}' not found under the import bases although top-level package "
+                               f"'{top}' is part of the repository")
+        return "external", f"top-level package '{top}' is not part of the repository"
 
-    root_node = {"id": "root"}
-    out.append(card(root_node, "PATCHPLUS TRACE", f"entry: {doc.get('entry_point', '')}", "code",
-                    "PATCHPLUS TRACE\nentry: " + str(doc.get("entry_point", ""))))
-    todo = list(reversed(root["children"]))
-    while todo:
-        n = todo.pop()
-        cat = n.get("category", "code")
-        out.append(card(n, f'{n["file"]}:{n["line"]}', n["code"], cat,
-                        f'{n["file"]}:{n["line"]}\n{n["code"]}'))
-        todo.extend(reversed(n["children"]))
-    out.append('</g>')
-    out.append(_SVG_CONTROLS)
-    out.append('</svg>')
-    return "\n".join(out) + "\n"
+    def _dotted(self, dotted, file):
+        """Dotted path -> {status, file, symbol, reason}.  status: resolved | resolved_module_only |
+        external | missing."""
+        b = self.b
+        mod = b._strict_module_file(dotted, 0, file)
+        if mod:
+            return dict(status="resolved", file=mod, symbol=None, reason=None)
+        if "." in dotted:
+            head, attr = dotted.rsplit(".", 1)
+            mf = b._strict_module_file(head, 0, file)
+            if mf:
+                sid = f"{mf}:{attr}"
+                if sid in b.symbols and b.symbols[sid].parent is None:
+                    return dict(status="resolved", file=mf, symbol=sid, reason=None)
+                t = b.resolve_name(attr, mf)
+                if t.kind == "symbol":
+                    return dict(status="resolved", file=b.symbols[t.ref].file, symbol=t.ref, reason="via re-export")
+                if t.kind == "module":
+                    return dict(status="resolved", file=t.ref, symbol=None, reason=None)
+                return dict(status="resolved_module_only", file=mf, symbol=None,
+                            reason=f"'{attr}' is not defined in {mf}")
+        st, why = self._classify_missing(dotted, file)
+        return dict(status=st, file=None, symbol=None, reason=why)
+
+    # -- analysis -------------------------------------------------------
+    def analyze(self, seed):
+        b = self.b
+        roles = OrderedDict(process_entry=None, configuration_root=None, request_routing_root=None,
+                            registered_apps=[])
+        notes = []
+        settings_rel = routing_rel = None
+        settings_module = None
+        if seed["role"] == "process_entry":
+            roles["process_entry"] = b.entry
+            dotted, line, expr = seed["settings_ref"]
+            self._add_file(b.entry, VIA_CONFIGURATION, "process entry")
+            if dotted is None:
+                self._unres("dynamic", expr, "DJANGO_SETTINGS_MODULE value is not a string literal", b.entry, line,
+                            "DJANGO_SETTINGS_MODULE")
+                notes.append("configuration root not determined: DJANGO_SETTINGS_MODULE is dynamic")
+            else:
+                r = self._dotted(dotted, b.entry)
+                settings_module = OrderedDict(reference=dotted, status=r["status"], file=r["file"], line=line)
+                if r["file"] and r["status"] in ("resolved", "resolved_module_only"):
+                    settings_rel = r["file"]
+                    self._edge(b.entry, settings_rel, EDGE_CONFIGURES, line, setting="DJANGO_SETTINGS_MODULE")
+                    self._add_file(settings_rel, VIA_CONFIGURATION, "DJANGO_SETTINGS_MODULE")
+                elif r["status"] == "external":
+                    self._ext(dotted, b.entry, line, "DJANGO_SETTINGS_MODULE", r["reason"])
+                else:
+                    self._unres("missing", dotted, r["reason"], b.entry, line, "DJANGO_SETTINGS_MODULE")
+        elif seed["role"] == "configuration_root":
+            settings_rel = b.entry
+            notes.append("process entry not derived: the selected entry is the settings module itself")
+        else:
+            routing_rel = b.entry
+            notes.append("configuration root not determined: the selected entry is a URL module, not a "
+                         "settings module (no settings are substituted)")
+        if settings_rel:
+            roles["configuration_root"] = settings_rel
+            self._add_file(settings_rel, VIA_CONFIGURATION, "settings module")
+            routing_rel = self._process_settings(settings_rel, roles)
+        if routing_rel:
+            roles["request_routing_root"] = routing_rel
+            self._add_file(routing_rel, VIA_CONFIGURATION, "request-routing root")
+            self._walk_urlconf(routing_rel, root=True)
+            self._handlers(routing_rel)
+        self._close_imports()
+        return self._result(seed, roles, settings_module, notes)
+
+    # settings ----------------------------------------------------------
+    def _settings_sources(self, srel):
+        """Settings split over several modules: follow `from x import *` / `from x import UPPER_NAME`."""
+        seen, queue = {srel}, [srel]
+        while queue:
+            rel = queue.pop(0)
+            tree = self.b.files.get(rel)
+            if tree is None:
+                continue
+            for st in _toplevel_stmts(tree.body):
+                if not isinstance(st, ast.ImportFrom):
+                    continue
+                if not any(a.name == "*" or a.name.isupper() for a in st.names):
+                    continue
+                target = self.b._strict_module_file(st.module or "", st.level, rel)
+                if not target or target == rel:
+                    continue
+                self._edge(rel, target, EDGE_IMPORTS, st.lineno, via="settings import")
+                self._add_file(target, VIA_CONFIGURATION, "imported settings")
+                self.settings_imports.append(OrderedDict(source=rel, target=target, line=st.lineno))
+                if target not in seen:
+                    seen.add(target)
+                    queue.append(target)
+
+    def _scalar_items(self, val):
+        return [] if val is None else (list(val) if isinstance(val, _Seq) else [val])
+
+    def _process_settings(self, srel, roles):
+        env = self.cfg.module_env(srel)
+        self._settings_sources(srel)
+        routing = None
+        # ROOT_URLCONF ----------------------------------------------------
+        if "ROOT_URLCONF" not in env:
+            self._unres("dynamic", "ROOT_URLCONF", "ROOT_URLCONF is not defined in the settings (a Django "
+                        "default is not assumed)", srel, None, "ROOT_URLCONF")
+        for it in self._scalar_items(env.get("ROOT_URLCONF")):
+            if it.kind != "str":
+                self._item_problem(it, "ROOT_URLCONF", "ROOT_URLCONF")
+                continue
+            r = self._dotted(it.value, it.file)
+            if r["status"] in ("resolved", "resolved_module_only") and r["symbol"] is None:
+                self._edge(it.file, r["file"], EDGE_CONFIGURES, it.line, setting="ROOT_URLCONF",
+                           conditional=it.conditional)
+                self._add_file(r["file"], VIA_CONFIGURATION, "ROOT_URLCONF")
+                routing = routing or r["file"]
+            elif r["status"] == "external":
+                self._ext(it.value, it.file, it.line, "ROOT_URLCONF", r["reason"])
+            else:
+                self._unres("missing", it.value, r["reason"] or "ROOT_URLCONF does not name a module",
+                            it.file, it.line, "ROOT_URLCONF")
+        # INSTALLED_APPS --------------------------------------------------
+        for it in self._scalar_items(env.get("INSTALLED_APPS")):
+            self._register_app(it, roles)
+        # MIDDLEWARE ------------------------------------------------------
+        for setting in ("MIDDLEWARE", "MIDDLEWARE_CLASSES"):
+            for it in self._scalar_items(env.get(setting)):
+                self._register_dotted(it, setting, EDGE_USES_MIDDLEWARE, self.middleware, "middleware")
+        # other dotted-path settings -------------------------------------------
+        for setting in self.DOTTED_SETTINGS:
+            for it in self._scalar_items(env.get(setting)):
+                self._register_dotted(it, setting, EDGE_CONFIGURES, self.other_settings, setting)
+        return routing
+
+    def _record(self, bucket, it, setting, r, **extra):
+        rec = OrderedDict(setting=setting, entry=it.value, status=r["status"], file=r["file"],
+                          symbol=r["symbol"], defined_in=it.file, line=it.line,
+                          conditional=it.conditional, reason=r["reason"])
+        rec.update(extra)
+        bucket.append(rec)
+        return rec
+
+    def _register_dotted(self, it, setting, etype, bucket, reason_label):
+        if it.kind != "str":
+            self._item_problem(it, setting)
+            return
+        r = self._dotted(it.value, it.file)
+        self._record(bucket, it, setting, r)
+        if r["status"] in ("resolved", "resolved_module_only"):
+            self._edge(it.file, r["file"], etype, it.line, setting=setting, entry=it.value,
+                       symbol=r["symbol"], conditional=it.conditional)
+            self._add_file(r["file"], VIA_CONFIGURATION, setting)
+            if r["status"] == "resolved_module_only":
+                self._unres("missing", it.value, r["reason"], it.file, it.line, setting)
+        elif r["status"] == "external":
+            self._ext(it.value, it.file, it.line, setting, r["reason"])
+        else:
+            self._unres("missing", it.value, r["reason"], it.file, it.line, setting)
+
+    def _register_app(self, it, roles):
+        if it.kind != "str":
+            self._item_problem(it, "INSTALLED_APPS")
+            return
+        r = self._dotted(it.value, it.file)
+        rec = self._record(self.apps, it, "INSTALLED_APPS", r)
+        if r["status"] == "external":
+            self._ext(it.value, it.file, it.line, "INSTALLED_APPS", r["reason"])
+            return
+        if r["status"] == "missing":
+            self._unres("missing", it.value, r["reason"], it.file, it.line, "INSTALLED_APPS")
+            return
+        app_file = r["file"]
+        self._edge(it.file, app_file, EDGE_REGISTERS_APP, it.line, setting="INSTALLED_APPS", app=it.value,
+                   symbol=r["symbol"], conditional=it.conditional)
+        self._add_file(app_file, VIA_CONFIGURATION, "INSTALLED_APPS")
+        roles["registered_apps"].append(app_file)
+        if r["status"] == "resolved_module_only":
+            self._unres("missing", it.value, r["reason"], it.file, it.line, "INSTALLED_APPS")
+        # Django loads <app>.models (and the AppConfig module) itself when it starts the app registry.
+        pkg = posixpath.dirname(app_file) if (posixpath.basename(app_file) == "__init__.py" or r["symbol"]) else None
+        implicit = []
+        if pkg is not None:
+            for name in ("models", "apps"):
+                for cand in (f"{pkg}/{name}.py", f"{pkg}/{name}/__init__.py"):
+                    if cand in self.b.py_files and cand != app_file:
+                        implicit.append(cand)
+                        self._edge(app_file, cand, EDGE_CONFIGURES, it.line, via=f"django app loading ({name} module)",
+                                   setting="INSTALLED_APPS", implicit=True)
+                        self._add_file(cand, VIA_CONFIGURATION, f"loaded by Django for app {it.value}")
+                        break
+        rec["implicit_modules"] = implicit
+
+    # URL configuration -------------------------------------------------
+    def _origin(self, file, node):
+        if isinstance(node, ast.Name):
+            imp = self.b.imports.get(file, {}).get(node.id)
+            if not imp:
+                return None
+            return f"{imp['module']}.{imp['name']}" if imp["name"] else imp["module"]
+        if isinstance(node, ast.Attribute):
+            o = self._origin(file, node.value)
+            return f"{o}.{node.attr}" if o else None
+        return None
+
+    def _django_func(self, file, node):
+        o = self._origin(file, node)
+        return o.rsplit(".", 1)[-1] if o and o.startswith("django.") else None
+
+    def _walk_urlconf(self, rel, root=False, name="urlpatterns"):
+        key = (rel, name)
+        self._url_stack.append(key)
+        try:
+            if rel in self.b.legacy_files:
+                self._unres("dynamic", rel, "file is analysed as text (not parseable): URL patterns not extracted",
+                            rel, None, "urlpatterns")
+                return
+            pats = self.cfg.module_env(rel).get(name)
+            if pats is None:
+                self._unres("dynamic", f"{rel}:{name}", f"no statically evaluable '{name}' defined in {rel}",
+                            rel, None, "urlpatterns")
+                return
+            self._walk_items(rel, self._scalar_items(pats))
+        finally:
+            self._url_stack.pop()
+            self._url_done.add(key)
+
+    def _walk_items(self, rel, items):
+        for it in items:
+            if it.kind == "call":
+                self._url_call(it.file, it.node)
+            elif it.kind == "dyn":
+                self._unres("dynamic", f"{it.file}: urlpatterns", it.reason, it.file, it.line, "urlpatterns")
+            elif it.kind in ("external", "module"):
+                self._ext(str(it.value), it.file, it.line, "urlpatterns")
+
+    def _url_call(self, file, call):
+        fn = self._django_func(file, call.func)
+        env = self.cfg.module_env(file)
+        if fn in self.URL_FUNCS:
+            self._route(file, call, fn)
+        elif fn == "i18n_patterns":
+            for a in call.args:
+                self._walk_items(file, self._scalar_items(self.cfg.eval(a, file, env, False)))
+        elif fn == "patterns":
+            for a in call.args[1:]:
+                if isinstance(a, ast.Call):
+                    self._url_call(file, a)
+        else:
+            t = self._resolve(file, call.func)
+            extra = f" (internal function {self.b.symbols[t.ref].id})" if t is not None and t.kind == "symbol" else ""
+            self._unres("dynamic", f"{ast.unparse(call.func)}()",
+                        f"URL patterns produced by {ast.unparse(call.func)}(){extra} are built at runtime; "
+                        f"not a recognised registration function", file, call.lineno, "urlpatterns")
+
+    def _resolve(self, file, node):
+        try:
+            return self.b.resolve_expr(node, Scope(file, None, f"file:{file}"))
+        except (KeyError, RecursionError, AttributeError):
+            return None
+
+    def _route(self, file, call, kind):
+        route = _const_str(call.args[0]) if call.args else None
+        if route is None and call.args:
+            route = ast.unparse(call.args[0])
+        view = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == "view"), None)
+        if view is None:
+            self._unres("dynamic", ast.unparse(call), "no view argument", file, call.lineno, "urlpatterns")
+            return
+        if isinstance(view, ast.Call) and self._django_func(file, view.func) == "include":
+            self._include(file, view, route)
+        else:
+            self._view(file, view, route, call.lineno, kind)
+
+    # include() ---------------------------------------------------------
+    def _submodule(self, rel, name):
+        return self.b._submodule_file(rel, name)
+
+    def _chain(self, file, node):
+        """Reference to a module / value through imports.  Returns ("module", rel) | ("value", rel, name) |
+        ("local", name) | ("external", dotted) | ("missing", dotted, reason) | None."""
+        names = []
+        n = node
+        while isinstance(n, ast.Attribute):
+            names.append(n.attr)
+            n = n.value
+        if not isinstance(n, ast.Name):
+            return None
+        names.reverse()
+        imp = self.b.imports.get(file, {}).get(n.id)
+        if imp is None:
+            return ("local", n.id) if not names else None
+        if imp["name"] is None:
+            mod = self.b._strict_module_file(imp["module"], imp["level"], file)
+            if mod is None:
+                return self._no_module(imp["module"], file, imp["level"])
+            state = ("module", mod)
+        else:
+            mod = self.b._strict_module_file(imp["module"], imp["level"], file)
+            if mod is None:
+                return self._no_module(f"{imp['module']}.{imp['name']}" if imp["module"] else imp["name"],
+                                       file, imp["level"])
+            sub = self._submodule(mod, imp["name"])
+            if sub:
+                state = ("module", sub)
+            elif imp["name"] in self.cfg.module_env(mod):
+                state = ("value", mod, imp["name"])
+            else:
+                return ("missing", f"{imp['module']}.{imp['name']}", f"'{imp['name']}' is neither a submodule nor a "
+                                                                       f"statically known value of {mod}")
+        for attr in names:
+            if state[0] != "module":
+                return None
+            sub = self._submodule(state[1], attr)
+            if sub:
+                state = ("module", sub)
+            elif attr in self.cfg.module_env(state[1]):
+                state = ("value", state[1], attr)
+            else:
+                return ("missing", f"{state[1]}.{attr}", f"'{attr}' is not defined in {state[1]}")
+        return state
+
+    def _no_module(self, dotted, file, level):
+        if level:
+            return ("missing", dotted or ".", "relative import does not resolve to a repository file")
+        st, why = self._classify_missing(dotted, file)
+        return (st, dotted, why)
+
+    def _urlconf_ref(self, file, node):
+        s = _const_str(node)
+        if s is not None:
+            r = self._dotted(s, file)
+            if r["status"] in ("resolved", "resolved_module_only") and r["symbol"] is None:
+                return ("module", r["file"])
+            return (r["status"] if r["status"] in ("external", "missing") else "missing", s,
+                    r["reason"] or "dotted name does not name a module")
+        if isinstance(node, ast.Tuple) and node.elts:                  # include((patterns, app_name))
+            return self._urlconf_ref(file, node.elts[0])
+        if isinstance(node, (ast.List,)):
+            return ("inline", self._scalar_items(self.cfg.eval(node, file, self.cfg.module_env(file), False)))
+        if isinstance(node, ast.Name) and node.id in self.cfg.module_env(file):
+            v = self.cfg.module_env(file)[node.id]
+            if isinstance(v, _Seq):
+                return ("inline", list(v))
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            res = self._chain(file, node)
+            if res is not None and res[0] != "local":
+                return res
+        return ("dynamic", ast.unparse(node), "include() argument is not a literal dotted name, an imported "
+                                              "module or a statically known list")
+
+    def _include(self, file, inc, route):
+        arg = inc.args[0] if inc.args else next((k.value for k in inc.keywords if k.arg == "urlconf_module"), None)
+        ns = next((_const_str(k.value) for k in inc.keywords if k.arg == "namespace"), None)
+        rec = OrderedDict(source=file, line=inc.lineno, route=route, reference=ast.unparse(arg) if arg else None,
+                          namespace=ns, status=None, target=None)
+        if arg is None:
+            rec["status"] = "dynamic"
+            self._unres("dynamic", ast.unparse(inc), "include() without an argument", file, inc.lineno, "urlpatterns")
+            self.includes.append(rec)
+            return
+        res = self._urlconf_ref(file, arg)
+        kind = res[0]
+        if kind in ("module", "value"):
+            rel = res[1]
+            name = res[2] if kind == "value" else "urlpatterns"
+            rec["status"], rec["target"] = "resolved", rel
+            self._edge(file, rel, EDGE_INCLUDES_URLS, inc.lineno, route=route, namespace=ns)
+            self._add_file(rel, VIA_CONFIGURATION, "included URL module")
+            key = (rel, name)
+            if key in self._url_stack:
+                rec["cycle"] = True
+                self.cycles.append(OrderedDict(source=file, target=rel, line=inc.lineno,
+                                               chain=[k[0] for k in self._url_stack] + [rel]))
+            elif key in self._url_done:
+                rec["already_walked"] = True
+            else:
+                self.includes.append(rec)
+                self._walk_urlconf(rel, name=name)
+                return
+        elif kind == "inline":
+            rec["status"] = "resolved_inline"
+            self.includes.append(rec)
+            self._walk_items(file, res[1])
+            return
+        elif kind == "external":
+            rec["status"] = "external"
+            self._ext(res[1], file, inc.lineno, "urlpatterns", res[2] if len(res) > 2 else "non-repository module")
+        else:                                           # missing | dynamic
+            rec["status"] = kind
+            self._unres(kind, res[1], res[2], file, inc.lineno, "urlpatterns")
+        self.includes.append(rec)
+
+    # views -------------------------------------------------------------
+    def _view(self, file, node, route, line, kind, wrapped=None):
+        rec = OrderedDict(source=file, line=line, route=route, kind=kind, reference=ast.unparse(node),
+                          status=None, target=None, wrapped_by=wrapped)
+        self.routes.append(rec)
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute) and f.attr == "as_view":
+                node = f.value
+            else:
+                t = self._resolve(file, f)
+                if t is not None and t.kind == "symbol":
+                    rec["status"] = "dynamic"
+                    self._unres("dynamic", ast.unparse(node), f"view built at runtime by internal call "
+                                f"{self.b.symbols[t.ref].id}()", file, line, "urlpatterns")
+                    return
+                if node.args and isinstance(node.args[0], (ast.Name, ast.Attribute, ast.Call)):
+                    self.routes.pop()                        # replaced by the wrapped view's record
+                    self._view(file, node.args[0], route, line, kind, wrapped=ast.unparse(f))
+                    return
+                rec["status"] = "dynamic"
+                self._unres("dynamic", ast.unparse(node), "view is produced by a call that is not a recognised "
+                            "wrapper", file, line, "urlpatterns")
+                return
+        if isinstance(node, ast.Lambda):
+            rec["status"] = "dynamic"
+            self._unres("dynamic", "<lambda>", "view is a lambda", file, line, "urlpatterns")
+            return
+        s = _const_str(node)
+        if s is not None:                                    # legacy string view 'pkg.views.name'
+            r = self._dotted(s, file)
+            self._finish_view(rec, file, line, route, r["status"], r["file"], r["symbol"], s, r["reason"])
+            return
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            t = self._resolve(file, node)
+            if t is None:
+                rec["status"] = "dynamic"
+                self._unres("dynamic", ast.unparse(node), "view reference could not be resolved to a definition",
+                            file, line, "urlpatterns")
+            elif t.kind == "symbol":
+                sym = self.b.symbols[t.ref]
+                self._finish_view(rec, file, line, route, "resolved", sym.file, sym.id, ast.unparse(node), None)
+            elif t.kind == "module":
+                rec["status"] = "dynamic"
+                self._unres("dynamic", ast.unparse(node), "reference names a module, not a view", file, line,
+                            "urlpatterns")
+            elif t.kind == "missing":
+                rec["status"] = "missing"
+                self._unres("missing", ast.unparse(node), f"internal module '{t.label}' is not in the repository",
+                            file, line, "urlpatterns")
+            else:                                            # external / stdlib / builtin
+                rec["status"] = "external"
+                self._ext(t.label or ast.unparse(node), file, line, "urlpatterns")
+            return
+        rec["status"] = "dynamic"
+        self._unres("dynamic", ast.unparse(node), f"{type(node).__name__} view expression is not resolvable",
+                    file, line, "urlpatterns")
+
+    def _finish_view(self, rec, file, line, route, status, vfile, sid, text, reason, handler=None):
+        if status in ("resolved", "resolved_module_only") and sid:
+            rec["status"], rec["target"] = "resolved", sid
+            attrs = dict(route=route)
+            if handler:
+                attrs["handler"] = handler
+            self._edge(file, sid, EDGE_ROUTES_TO, line, tgt_is_file=False, **attrs)
+            self.b.arch_symbols.add(sid)
+            self._add_file(vfile, VIA_CONFIGURATION, "routed view")
+        elif status in ("resolved", "resolved_module_only"):
+            rec["status"] = "dynamic"
+            self._unres("dynamic", text, reason or "dotted name does not name a view callable", file, line,
+                        "urlpatterns")
+        elif status == "external":
+            rec["status"] = "external"
+            self._ext(text, file, line, "urlpatterns", reason or "non-repository view")
+        else:
+            rec["status"] = "missing"
+            self._unres("missing", text, reason, file, line, "urlpatterns")
+
+    def _handlers(self, rel):
+        env = self.cfg.module_env(rel)
+        for name in self.HANDLERS:
+            for it in self._scalar_items(env.get(name)):
+                rec = OrderedDict(source=it.file, line=it.line, route=name, kind="handler", reference=it.value,
+                                  status=None, target=None, wrapped_by=None)
+                if it.kind != "str":
+                    rec["status"] = "dynamic"
+                    self._item_problem(it, name)
+                else:
+                    r = self._dotted(it.value, it.file)
+                    self._finish_view(rec, it.file, it.line, name, r["status"], r["file"], r["symbol"], it.value,
+                                      r["reason"], handler=name)
+                self.handlers.append(rec)
+
+    # bounded import closure --------------------------------------------
+    def _internal_imports(self, rel):
+        out = []
+        for imp in self.b.imports.get(rel, {}).values():
+            mod = self.b._strict_module_file(imp["module"], imp["level"], rel)
+            if mod is None:
+                continue
+            if imp["name"] and imp["name"] != "*":
+                sub = self.b._submodule_file(mod, imp["name"])
+                if sub:
+                    out.append((sub, imp["line"]))
+                    continue
+            out.append((mod, imp["line"]))
+        return out
+
+    def _close_imports(self):
+        """Internal imports of configuration-discovered files, to `arch_depth` hops.  This is what lets a routed
+        view reach the models it imports.  Bounded in depth and in file count; never touches reached_files."""
+        depth_limit, cap = self.b.arch_depth, self.b.arch_max_files
+        queue = [(rel, 0) for rel, d in self.files.items() if VIA_CONFIGURATION in d["via"]]
+        seen = {rel for rel, _ in queue}
+        while queue:
+            rel, depth = queue.pop(0)
+            if depth >= depth_limit:
+                continue
+            for target, line in self._internal_imports(rel):
+                if target == rel:
+                    continue
+                self._edge(rel, target, EDGE_IMPORTS, line, via="architecture import", depth=depth + 1)
+                if target in seen:
+                    continue
+                if len(self.files) >= cap:
+                    self.capped = True
+                    return
+                seen.add(target)
+                self._add_file(target, VIA_ARCH_IMPORT, f"imported by {rel}", depth + 1)
+                queue.append((target, depth + 1))
+
+    # result ------------------------------------------------------------
+    def _result(self, seed, roles, settings_module, notes):
+        b = self.b
+        executed = set(b.reached_files)
+        by_cfg = {r for r, d in self.files.items() if VIA_CONFIGURATION in d["via"]}
+        by_arch_imp = {r for r, d in self.files.items() if d["via"] == [VIA_ARCH_IMPORT]}
+        exec_imports = {t for (s, t), (k, _l) in b.import_edges.items()
+                        if k == "internal" and s in executed and t in b.py_files} - executed
+        related = executed | exec_imports | by_cfg | by_arch_imp
+        unrelated = sorted(b.py_files - related)
+        for rel, d in self.files.items():
+            node = b.nodes.setdefault(f"file:{rel}", {"id": f"file:{rel}", "type": "file", "file": rel, "line": None})
+            node["discovered_via"] = list(d["via"])
+        file_entries = OrderedDict()
+        for rel in sorted(self.files):
+            d = self.files[rel]
+            via = list(d["via"]) + ([VIA_EXECUTION] if rel in executed else [])
+            file_entries[rel] = OrderedDict(discovered_via=via, execution_reached=rel in executed,
+                                            reasons=d["reasons"], depth=d["depth"])
+        stats = OrderedDict(
+            indexed_files=len(b.py_files), execution_reached_files=len(executed),
+            import_reached_files=len(exec_imports), configuration_files=len(by_cfg),
+            architecture_import_files=len(by_arch_imp), unrelated_files=len(unrelated),
+            configuration_only_files=len(by_cfg - executed),
+            registered_apps=len(roles["registered_apps"]), middleware=len(self.middleware),
+            url_includes=len(self.includes), routes=len(self.routes),
+            routes_resolved=sum(1 for r in self.routes if r["status"] == "resolved"),
+            unresolved=len(self.unresolved), external=len(self.external), cycles=len(self.cycles),
+            architecture_symbols=len(b.arch_symbols), capped=self.capped)
+        return OrderedDict([
+            ("framework", self.framework), ("active", True), ("seed_role", seed["role"]),
+            ("roles", roles), ("settings_module", settings_module), ("notes", notes),
+            ("installed_apps", self.apps), ("middleware", self.middleware), ("other_settings", self.other_settings),
+            ("settings_imports", self.settings_imports), ("url_includes", self.includes), ("routes", self.routes),
+            ("handlers", self.handlers), ("cycles", self.cycles),
+            ("unresolved", self.unresolved), ("external", self.external),
+            ("classification", OrderedDict([
+                ("execution", sorted(executed)), ("import_of_execution", sorted(exec_imports)),
+                ("configuration", sorted(by_cfg)), ("architecture_import", sorted(by_arch_imp)),
+                ("unrelated_count", len(unrelated)),
+                ("unrelated_files", unrelated[:500]), ("unrelated_files_truncated", len(unrelated) > 500)])),
+            ("files", file_entries), ("statistics", stats)])
+
+
+FRAMEWORK_ANALYZERS = OrderedDict([("django", DjangoAnalyzer)])
+
+
+def framework_report_lines(info):
+    """Text rendering of the framework result (report.txt section)."""
+    if not info:
+        return []
+    bar = "=" * 78
+    o = [bar, "13. FRAMEWORK / CONFIGURATION ARCHITECTURE (static; separate from the execution trace)", bar]
+    if not info.get("active"):
+        return o + [f"  framework '{info['framework']}' requested but not detected: {info.get('reason')}", ""]
+    r, st = info["roles"], info["statistics"]
+    o += [f"Framework             : {info['framework']}",
+          f"Process entry         : {r['process_entry'] or '(not derived)'}",
+          f"Configuration root    : {r['configuration_root'] or '(not determined)'}",
+          f"Request-routing root  : {r['request_routing_root'] or '(not determined)'}",
+          f"Registered apps       : {st['registered_apps']}",
+          *[f"Note                  : {n}" for n in info["notes"]], "",
+          "Files by how they were reached (execution is NOT inflated by configuration discovery):",
+          f"  indexed                 : {st['indexed_files']}",
+          f"  execution (calls)       : {st['execution_reached_files']}",
+          f"  imported by executed    : {st['import_reached_files']}",
+          f"  configuration           : {st['configuration_files']}  (of which not executed: {st['configuration_only_files']})",
+          f"  architecture imports    : {st['architecture_import_files']}",
+          f"  unrelated to the root   : {st['unrelated_files']}",
+          f"Routes: {st['routes']} ({st['routes_resolved']} resolved)   URL includes: {st['url_includes']}   "
+          f"Middleware: {st['middleware']}   Cycles: {st['cycles']}   Unresolved: {st['unresolved']}   "
+          f"External: {st['external']}", ""]
+    for title, key in (("INSTALLED_APPS", "installed_apps"), ("MIDDLEWARE", "middleware")):
+        o.append(title)
+        for a in info[key]:
+            o.append(f"  [{a['status']}] {a['entry']}  ->  {a['file'] or '-'}  ({a['defined_in']}:{a['line']})")
+    o.append("URL INCLUDES")
+    for i in info["url_includes"]:
+        o.append(f"  [{i['status']}] {i['source']}:{i['line']}  include({i['reference']})  ->  {i['target'] or '-'}"
+                 + ("   (cycle)" if i.get("cycle") else ""))
+    o.append("UNRESOLVED")
+    for u in info["unresolved"]:
+        o.append(f"  [{u['category']}] {u['file']}:{u['line']}  {u['reference']}  - {u['reason']}")
+    if not info["unresolved"]:
+        o.append("  (none)")
+    o.append("")
+    return o
 
 
 class Visitor(ast.NodeVisitor):
@@ -3924,6 +5232,8 @@ class Visitor(ast.NodeVisitor):
                 for tg in node.targets:
                     if isinstance(tg, ast.Name):
                         self.scope.vars[tg.id] = t
+            else:
+                self.b._bind_candidates(node.targets, node.value, self.scope)
         for tg in node.targets:                            # x = {..: f} / x = f  -> REFERENCES edges
             self.b.note_binding_refs(tg, self.scope)
 
@@ -3938,18 +5248,11 @@ class Visitor(ast.NodeVisitor):
             self.b.handle_dispatch(node, d, self.scope, self.depth)
         else:
             t = self.b.resolve_expr(node.func, self.scope)
-            self.b.handle_call(node, t, self.scope, self.depth)
+            cands = [t] if t is not None else self.b.resolve_candidates(node.func, self.scope)
+            if cands:                                      # several possible receivers / targets: follow every one
+                for c in cands:
+                    self.b.handle_call(node, c, self.scope, self.depth)
+            else:
+                self.b.handle_call(node, None, self.scope, self.depth)
         self.b.note_arg_references(node, self.scope)
         self.generic_visit(node)
-
-
-def run_topdown_from_trace(trace_tree_json, outdir):
-    """Top-down functionality extraction from an existing ``trace_tree.json`` (no repository analysis).
-
-    The trace-tree text is produced by the Python tracer, so this belongs to the Python broker."""
-    with open(trace_tree_json, "r", encoding="utf-8") as fh:
-        doc = json.load(fh)
-    result = extract_topdown_functionalities(doc["root"], project=doc.get("project", ""),
-                                             entry_point=doc.get("entry_point", ""))
-    write_topdown_outputs(result, outdir)
-    return result
